@@ -119,50 +119,26 @@ fn main() {
                         let utxos = dust.iter().map(|out| out.outpoint).collect::<Vec<_>>();
                         debug!("utxos: {:?}", &utxos);
 
-                        // check trxs from mempool matching the privacy:
-                        // has a single op_return
-                        // one or more inputs with SIGHASH_ALL|ANYONECANPAY signature type
-                        // op_return: can be empty or contains the string "ash"(to ensure trx
-                        // size above the min relayable size of 65 bytes)
-                        // yes:
-                        // add the inputs from this tx to the new trx if:
-                        // the new fee rate is at least 1 sat/vb greater than the original transaction
-                        // create a new PSBT
-                        // sign and broadcast
                         let rpc_client =
                             Client::new(&url, auth.clone()).expect("failed to create rpc client");
                         let tx_ids = rpc_client
                             .get_raw_mempool()
                             .expect("failed to get mempool transaction IDs");
 
-                        let mut existing_txs: Vec<Transaction> = vec![];
-                        let mut suggested_data: Vec<u8> = vec![];
+                        let mut unconfirmed_txs: Vec<Transaction> = vec![];
+                        // the new tx will use the first unconfirmed tx's script data
+                        let mut first_found_script: Option<Vec<u8>> = None;
+
                         // find txs in the mempool that match ddust pattern
                         for txid in tx_ids {
                             let tx = rpc_client.get_raw_transaction(&txid, None).unwrap();
-                            let vouts = &tx.output;
-                            if vouts.len() == 1 {
-                                let script_pubkey = &vouts[0].script_pubkey;
-                                let is_op_return = script_pubkey.is_op_return();
-
-                                if is_op_return {
-                                    let script_bytes = script_pubkey.as_bytes();
-                                    // [0x61, 0x73, 0x68]
-                                    let ash_bytes = "ash".as_bytes();
-                                    let is_dust_disposal = script_bytes == [0x6a] // empty
-                                        || script_bytes == [&[0x6a, 0x03], ash_bytes].concat(); // "ash"
-
-                                    if is_dust_disposal && existing_txs.is_empty() {
-                                        suggested_data = match script_bytes {
-                                            // empty OP_RETURN no data
-                                            [0x6a] => vec![], 
-                                            // skip 0x6a (OP_RETURN) and push byte
-                                            [0x6a, _, rest @ ..] => rest.to_vec(),
-                                            _ => vec![],
-                                        };
-                                        existing_txs.push(tx);
-                                    }
+                            if is_ddust_tx(&tx, &first_found_script) {
+                                if first_found_script == None {
+                                    let script_bytes =
+                                        tx.output[0].script_pubkey.as_bytes().to_vec();
+                                    first_found_script = Some(script_bytes);
                                 }
+                                unconfirmed_txs.push(tx);
                             }
                         }
 
@@ -175,7 +151,7 @@ fn main() {
                             .expect("failed to add dust outpoints");
 
                         // add inputs of unconfirmed txs
-                        for tx in &existing_txs {
+                        for tx in &unconfirmed_txs {
                             for input in &tx.input {
                                 let f_outpoint = input.previous_output;
                                 let f_input_prev_tx = rpc_client
@@ -202,22 +178,37 @@ fn main() {
                                         input.segwit_weight(),
                                         input.sequence,
                                     )
-                                    .unwrap();
-                                }
+                                    .expect(&format!(
+                                        "failed to add the foreign UTXO. Outpoint: {}",
+                                        f_outpoint
+                                    ));
+                            }
                         }
 
                         tx_builder.fee_absolute(input_amount);
 
                         // add op_return with data if single input so Tx is 65vb
-                        if existing_txs.is_empty() && dust.len() == 1 {
+                        if unconfirmed_txs.is_empty() && dust.len() == 1 {
                             let data = PushBytesBuf::try_from("ash".as_bytes().to_vec()).unwrap();
                             tx_builder.add_data(&data);
                         }
-                        // otherwise op_return with no data or same data as found in the existing
-                        // tx
+                        // otherwise op_return with no data or same data as found in the  first
+                        // unconfirmed tx
                         else {
-                            let data = PushBytesBuf::try_from(suggested_data).unwrap();
-                            tx_builder.add_data(&data);
+                            if let Some(script_bytes) = first_found_script {
+                                let op_return = match script_bytes.as_slice() {
+                                    // empty OP_RETURN no data
+                                    [0x6a] => vec![],
+                                    // skip 0x6a (OP_RETURN) and push byte
+                                    [0x6a, _, rest @ ..] => rest.to_vec(),
+                                    _ => vec![],
+                                };
+                                let data = PushBytesBuf::try_from(op_return).unwrap();
+                                tx_builder.add_data(&data);
+                            } else {
+                                let data = PushBytesBuf::try_from(vec![]).unwrap();
+                                tx_builder.add_data(&data);
+                            }
                         }
 
                         // set script type to ANYONECANPAY|ALL
@@ -480,4 +471,63 @@ fn wallet_names(db: Arc<Database>) -> Vec<String> {
             name.strip_suffix("_keychain").map(|name| name.to_string())
         })
         .collect::<Vec<String>>()
+}
+
+/// ddust pattern:
+/// has a single op_return
+/// one or more inputs with SIGHASH_ALL|ANYONECANPAY signature type
+/// op_return: can be empty or contains the string "ash"
+fn is_ddust_tx(tx: &Transaction, want_script: &Option<Vec<u8>>) -> bool {
+    // Must have exactly one output
+    if tx.output.len() != 1 {
+        return false;
+    }
+
+    // Must be OP_RETURN
+    let script = &tx.output[0].script_pubkey;
+    if !script.is_op_return() {
+        return false;
+    }
+
+    // Must be empty OP_RETURN or "ash"
+    let script_bytes = script.as_bytes();
+    let is_dust_disposal = if let Some(existing_script) = want_script {
+        script_bytes == existing_script.as_slice()
+    } else {
+        script_bytes == [0x6a] || script_bytes == [0x6a, 0x03, 0x61, 0x73, 0x68]
+    };
+
+    if !is_dust_disposal {
+        return false;
+    }
+
+    // All inputs must be ANYONECANPAY|ALL
+    const SIGHASH_ANYONECANPAY_ALL: u8 = 0x81;
+
+    for input in &tx.input {
+        if input.witness.is_empty() {
+            return false;
+        }
+
+        let sig = input.witness.nth(0).unwrap();
+
+        match sig.len() {
+            // Taproot with explicit sighash
+            65 => {
+                if sig[64] != SIGHASH_ANYONECANPAY_ALL {
+                    return false;
+                }
+            }
+            // ECDSA (P2WPKH/P2WSH)
+            71..=73 => {
+                if *sig.last().unwrap() != SIGHASH_ANYONECANPAY_ALL {
+                    return false;
+                }
+            }
+            // Taproot default sighash (64 bytes) or unknown
+            _ => return false,
+        }
+    }
+
+    true
 }
