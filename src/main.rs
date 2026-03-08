@@ -44,22 +44,23 @@ fn main() {
     let db_file = args
         .datadir
         .join(format!("ddust-{}.redb", network.to_string().to_lowercase()));
-    debug!("db file: {:?}", db_file);
+    info!("db file: {:?}", db_file);
     let db = Database::create(db_file).expect("failed to open database");
     let db = Arc::new(db);
     let url = default_url(&network);
     let auth = default_auth(&args.datadir, &network);
+    let rpc_client = Client::new(&url, auth.clone()).expect("failed to create rpc client");
     match args.command {
-        Commands::Add { desc } => {
+        Commands::Add { desc, start_height } => {
             let wallet_name = wallet_name_from_descriptor(desc.clone(), None, network, &secp)
                 .expect("must be a valid descriptor");
 
             if let (Some(mut wallet), mut store) = load_wallet(db.clone(), network, wallet_name) {
-                sync_wallet(&url, &auth, &mut wallet, &mut store);
+                sync_wallet(&rpc_client, &mut wallet, &mut store);
             } else {
-                let wallets = add_descriptor(&secp, db, network, desc);
+                let wallets = add_descriptor(&secp, db, network, desc, start_height, &rpc_client);
                 wallets.into_iter().for_each(|(mut wallet, mut store)| {
-                    sync_wallet(&url, &auth, &mut wallet, &mut store);
+                    sync_wallet(&rpc_client, &mut wallet, &mut store);
                 })
             }
         }
@@ -69,7 +70,7 @@ fn main() {
                 if let (Some(mut wallet), mut store) =
                     load_wallet(db.clone(), network, wallet_name.clone())
                 {
-                    sync_wallet(&url, &auth, &mut wallet, &mut store);
+                    sync_wallet(&rpc_client, &mut wallet, &mut store);
                     wallet.list_unspent().for_each(|out| {
                         if !out.is_spent && out.txout.value <= dust_amount {
                             let address = Address::from_script(&out.txout.script_pubkey, network)
@@ -96,7 +97,7 @@ fn main() {
                 if let (Some(mut wallet), mut store) =
                     load_wallet(db.clone(), network, wallet_name.clone())
                 {
-                    sync_wallet(&url, &auth, &mut wallet, &mut store);
+                    sync_wallet(&rpc_client, &mut wallet, &mut store);
                     let dust = wallet
                         .list_unspent()
                         .filter_map(|out| {
@@ -118,10 +119,6 @@ fn main() {
                         let mut input_amount: Amount = dust.iter().map(|out| out.txout.value).sum();
                         debug!("fees: {}", &input_amount);
                         let utxos = dust.iter().map(|out| out.outpoint).collect::<Vec<_>>();
-                        debug!("utxos: {:?}", &utxos);
-                        let rpc_client =
-                            Client::new(&url, auth.clone()).expect("failed to create rpc client");
-
                         let unconfirmed_txs = find_unconfirmed_ddust_txs(&rpc_client);
                         info!("found {} unconfirmed ddust txs", unconfirmed_txs.len());
 
@@ -266,6 +263,9 @@ enum Commands {
         /// Descriptor to add
         #[arg(value_parser = parse_descriptor)]
         desc: ExtendedDescriptor,
+        /// Block height to start scanning for transactions
+        #[arg(short, long, default_value_t = 0)]
+        start_height: u32,
     },
     /// List all dust UTXOs in your wallet descriptor(s)
     List,
@@ -349,6 +349,8 @@ fn add_descriptor(
     db: Arc<Database>,
     network: Network,
     descriptor: ExtendedDescriptor,
+    start_height: u32,
+    rpc_client: &Client,
 ) -> Vec<(PersistedWallet<Store>, Store)> {
     if descriptor.is_multipath() {
         let single_descriptors = descriptor
@@ -356,10 +358,17 @@ fn add_descriptor(
             .expect("must be multipath");
         single_descriptors
             .into_iter()
-            .map(|desc| create_wallet(secp, db.clone(), network, desc))
+            .map(|desc| create_wallet(secp, db.clone(), network, desc, start_height, rpc_client))
             .collect()
     } else {
-        vec![create_wallet(secp, db.clone(), network, descriptor)]
+        vec![create_wallet(
+            secp,
+            db.clone(),
+            network,
+            descriptor,
+            start_height,
+            rpc_client,
+        )]
     }
 }
 
@@ -382,31 +391,46 @@ fn create_wallet(
     db: Arc<Database>,
     network: Network,
     single_descriptor: ExtendedDescriptor,
+    start_height: u32,
+    rpc_client: &Client,
 ) -> (PersistedWallet<Store>, Store) {
     let wallet_name = wallet_name_from_descriptor(single_descriptor.clone(), None, network, secp)
         .expect("must be a valid descriptor");
     let mut wallet_store = Store::new(db.clone(), wallet_name).expect("db store not created");
-    let wallet = Wallet::create_single(single_descriptor)
+    let mut wallet = Wallet::create_single(single_descriptor)
         .network(network)
         .create_wallet(&mut wallet_store)
         .expect("unable to create wallet");
+    if start_height > 0 {
+        let genesis_hash = rpc_client
+            .get_block_hash(0)
+            .expect("failed to get genesis block hash");
+        let start_hash = rpc_client
+            .get_block_hash(start_height as u64)
+            .expect("failed to get start block hash");
+        let start_block = rpc_client
+            .get_block(&start_hash)
+            .expect("failed to get start block");
+        wallet
+            .apply_block_connected_to(&start_block, start_height, (0, genesis_hash).into())
+            .expect("failed to apply start block");
+    }
     (wallet, wallet_store)
 }
 
-fn sync_wallet(url: &str, auth: &Auth, wallet: &mut PersistedWallet<Store>, store: &mut Store) {
-    let rpc_client = Client::new(url, auth.clone()).expect("failed to create rpc client");
+fn sync_wallet(rpc_client: &Client, wallet: &mut PersistedWallet<Store>, store: &mut Store) {
     let blockchain_info = rpc_client.get_blockchain_info().unwrap();
     info!(
         "connected to bitcoin core rpc, chain: {}",
         blockchain_info.chain
     );
-    debug!(
+    info!(
         "latest block: {} at height {}",
         blockchain_info.best_block_hash, blockchain_info.blocks,
     );
 
     let wallet_tip: CheckPoint = wallet.latest_checkpoint();
-    debug!(
+    info!(
         "current wallet tip is: {} at height {}",
         &wallet_tip.hash(),
         &wallet_tip.height()
@@ -423,7 +447,7 @@ fn sync_wallet(url: &str, auth: &Auth, wallet: &mut PersistedWallet<Store>, stor
         )
         .filter(|tx| tx.chain_position.is_unconfirmed());
     let mut emitter = Emitter::new(
-        &rpc_client,
+        rpc_client,
         wallet_tip.clone(),
         emitter_height,
         expected_mempool_tx,
@@ -442,7 +466,7 @@ fn sync_wallet(url: &str, auth: &Auth, wallet: &mut PersistedWallet<Store>, stor
             percent_done
         );
         if block.block_height() % 10_000 == 0 {
-            debug!(
+            info!(
                 "persisting blocks to height: {}, {:.2}% done",
                 block.block_height(),
                 percent_done
