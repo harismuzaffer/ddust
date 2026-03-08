@@ -1,7 +1,8 @@
 set quiet := true
 wallet := "test"
+type := "bech32" # valid address types are: legacy, p2sh-segwit, bech32, bech32m
 datadir := "data"
-chain := "signet" # can also be main, test, testnet4, signet
+chain := "regtest" # valid networks are: main, test, testnet4, signet, regtest
 logdir := if chain == "main" {
           "."
         } else if chain == "test" {
@@ -95,7 +96,7 @@ unload:
 # get wallet address
 [group('rpc')]
 address:
-    bitcoin-cli -datadir={{datadir}} -chain={{chain}} -rpcwallet={{wallet}} getnewaddress
+    bitcoin-cli -datadir={{datadir}} -chain={{chain}} -rpcwallet={{wallet}} getnewaddress "" {{type}}
 
 # generate n new blocks to given address
 [group('rpc')]
@@ -106,6 +107,26 @@ generate n address:
 [group('rpc')]
 balance:
     bitcoin-cli -datadir={{datadir}} -chain={{chain}} -rpcwallet={{wallet}} getbalance
+
+# get wallet transaction details
+[group('rpc')]
+tx txid:
+    bitcoin-cli -datadir={{datadir}} -chain={{chain}} -rpcwallet={{wallet}} gettransaction {{txid}}
+
+# list wallet transactions
+[group('rpc')]
+txs:
+    bitcoin-cli -datadir={{datadir}} -chain={{chain}} -rpcwallet={{wallet}} listtransactions
+
+# list wallet utxos
+[group('rpc')]
+utxos:
+    bitcoin-cli -datadir={{datadir}} -chain={{chain}} -rpcwallet={{wallet}} listunspent
+
+# decode a psbt
+[group('rpc')]
+decode psbt:
+    bitcoin-cli -datadir={{datadir}} -chain={{chain}} -rpcwallet={{wallet}} decodepsbt {{psbt}}
 
 # send n btc to address from wallet
 [group('rpc')]
