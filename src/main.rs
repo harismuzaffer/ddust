@@ -10,8 +10,10 @@ use bdk_bitcoind_rpc::bitcoincore_rpc::{Auth, Client, RpcApi};
 use bdk_redb::redb::{Database, TableHandle};
 use bdk_wallet::KeychainKind::Internal;
 use bdk_wallet::bitcoin::absolute::LockTime;
+use bdk_wallet::bitcoin::ecdsa::Signature;
 use bdk_wallet::bitcoin::psbt::Input;
 use bdk_wallet::bitcoin::psbt::PsbtParseError;
+use bdk_wallet::bitcoin::script::Instruction;
 use bdk_wallet::bitcoin::script::PushBytesBuf;
 use bdk_wallet::chain::{CanonicalizationParams, CheckPoint};
 use bdk_wallet::{LocalOutput, PersistedWallet, Wallet, miniscript, wallet_name_from_descriptor};
@@ -72,7 +74,7 @@ fn main() {
                 {
                     sync_wallet(&rpc_client, &mut wallet, &mut store);
                     wallet.list_unspent().for_each(|out| {
-                        if !out.is_spent && out.txout.value <= dust_amount {
+                        if is_dust(&out, &dust_amount) {
                             let address = Address::from_script(&out.txout.script_pubkey, network)
                                 .expect("failed to get address");
                             let value = out.txout.value.display_dynamic();
@@ -104,20 +106,16 @@ fn main() {
                             let out_address =
                                 Address::from_script(&out.txout.script_pubkey, network)
                                     .expect("failed to get address");
-                            if !out.is_spent
-                                && out.txout.value <= dust_amount
-                                && filter_address == out_address
-                            {
+                            if is_dust(&out, &dust_amount) && filter_address == out_address {
                                 Some(out)
                             } else {
                                 None
                             }
                         })
                         .collect::<Vec<_>>();
-                    info!("dust: {:?}", dust);
+                    debug!("dust: {:?}", dust);
                     if !dust.is_empty() {
                         let mut input_amount: Amount = dust.iter().map(|out| out.txout.value).sum();
-                        debug!("fees: {}", &input_amount);
                         let utxos = dust.iter().map(|out| out.outpoint).collect::<Vec<_>>();
                         let unconfirmed_txs = find_unconfirmed_ddust_txs(&rpc_client);
                         info!("found {} unconfirmed ddust txs", unconfirmed_txs.len());
@@ -161,7 +159,14 @@ fn main() {
                                         f_psbt_input.non_witness_utxo =
                                             Some(f_input_prev_tx.clone());
                                     }
-                                    f_psbt_input.final_script_witness = Some(input.witness.clone());
+                                    if !input.witness.is_empty() {
+                                        f_psbt_input.final_script_witness =
+                                            Some(input.witness.clone());
+                                    }
+                                    if !input.script_sig.is_empty() {
+                                        f_psbt_input.final_script_sig =
+                                            Some(input.script_sig.clone());
+                                    }
                                     tx_builder
                                         .add_foreign_utxo_with_sequence(
                                             f_outpoint,
@@ -178,7 +183,7 @@ fn main() {
                                 }
                             }
                         }
-                        debug!("combined fees: {}", &input_amount);
+                        info!("total spent to fees: {}", &input_amount);
                         tx_builder.fee_absolute(input_amount);
 
                         if !unconfirmed_txs.is_empty() {
@@ -221,7 +226,6 @@ fn main() {
             }
         }
         Commands::Broadcast { psbt } => {
-            let rpc_client = Client::new(&url, auth.clone()).expect("failed to create rpc client");
             let tx = psbt
                 .extract_tx()
                 .expect("failed to extract transaction from PSBT");
@@ -496,7 +500,6 @@ fn find_unconfirmed_ddust_txs(rpc_client: &Client) -> Vec<Transaction> {
     let tx_ids = rpc_client
         .get_raw_mempool()
         .expect("failed to get mempool transaction IDs");
-
     let mut unconfirmed_txs: Vec<Transaction> = vec![];
     // the combined tx shall use the first unconfirmed tx's script data
     let mut first_found_script: Option<Vec<u8>> = None;
@@ -546,30 +549,38 @@ fn is_ddust_tx(tx: &Transaction, want_script: &Option<Vec<u8>>) -> bool {
 
     // All inputs must be ANYONECANPAY|ALL
     for input in &tx.input {
-        if input.witness.is_empty() {
-            return false;
+        if !input.witness.is_empty() {
+            // If a segwit input check the witness sighash byte
+            let sig = input.witness.nth(0).unwrap();
+            match sig.len() {
+                // Taproot with explicit sighash
+                65 => {
+                    if sig[64] != TapSighashType::AllPlusAnyoneCanPay as u8 {
+                        return false;
+                    }
+                }
+                // ECDSA (P2WPKH/P2WSH)
+                71..=73 => {
+                    if *sig.last().unwrap() != EcdsaSighashType::AllPlusAnyoneCanPay as u8 {
+                        return false;
+                    }
+                }
+                // Taproot default sighash (64 bytes) or unknown
+                _ => return false,
+            }
         }
-
-        let sig = input.witness.nth(0).unwrap();
-
-        match sig.len() {
-            // Taproot with explicit sighash
-            65 => {
-                if sig[64] != TapSighashType::AllPlusAnyoneCanPay as u8 {
+        // If a legacy input check the script sig sighash byte
+        else if input.script_sig.is_p2pkh() || input.script_sig.is_p2sh() {
+            for instruction in input.script_sig.instructions() {
+                if let Ok(Instruction::PushBytes(data)) = instruction
+                    && let Ok(sig) = Signature::from_slice(data.as_bytes())
+                    && sig.sighash_type != EcdsaSighashType::AllPlusAnyoneCanPay
+                {
                     return false;
                 }
             }
-            // ECDSA (P2WPKH/P2WSH)
-            71..=73 => {
-                if *sig.last().unwrap() != EcdsaSighashType::AllPlusAnyoneCanPay as u8 {
-                    return false;
-                }
-            }
-            // Taproot default sighash (64 bytes) or unknown
-            _ => return false,
         }
     }
-
     true
 }
 
@@ -597,6 +608,11 @@ fn estimate_input_vsize(script_pubkey: &ScriptBuf) -> f64 {
     } else {
         panic!("Unsupported input encountered");
     }
+}
+
+/// Returns true if `LocalOutput` is not spent, under the dust amount threshold, and is confirmed.
+fn is_dust(out: &LocalOutput, dust_amount: &Amount) -> bool {
+    !out.is_spent && out.txout.value <= *dust_amount && out.chain_position.is_confirmed()
 }
 
 /// Checks if combining dust inputs with existing ddust transactions in the mempool
@@ -650,5 +666,11 @@ fn should_combine(
     }
 
     let tx_fee_rate = input_amount.to_sat() as f64 / tx_vsize;
-    tx_fee_rate > max_fee_rate + 1.0
+    debug!(
+        "tx_fee_rate: {}, max_fee_rate: {}, combine? {}",
+        tx_fee_rate,
+        max_fee_rate,
+        tx_fee_rate > max_fee_rate + 0.1
+    );
+    tx_fee_rate > max_fee_rate + 0.1
 }
