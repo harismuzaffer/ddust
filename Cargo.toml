@@ -9,6 +9,8 @@ license = "MIT"
 bdk_wallet = "2"
 bdk_bitcoind_rpc = "0.22"
 bdk_redb = "0.1.1"
+corepc-node = { version = "0.10.1", features = ["29_0"] }
+corepc-client = "0.10.0"
 clap = { version = "4", features = ["derive", "env"] }
 tracing = "0.1"
 tracing-subscriber = "0.3.22"
