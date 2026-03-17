@@ -55,193 +55,224 @@ fn main() {
     let url = default_url(&network);
     let auth = default_auth(&args.datadir, &network);
     let rpc_client = Client::new(&url, auth.clone()).expect("failed to create rpc client");
+
     match args.command {
         Commands::Add { desc, start_height } => {
-            let wallet_name = wallet_name_from_descriptor(desc.clone(), None, network, &secp)
-                .expect("must be a valid descriptor");
-
-            if let (Some(mut wallet), mut store) = load_wallet(db.clone(), network, wallet_name) {
-                sync_wallet(&rpc_client, &mut wallet, &mut store);
-            } else {
-                let wallets = add_descriptor(&secp, db, network, desc, start_height, &rpc_client);
-                wallets.into_iter().for_each(|(mut wallet, mut store)| {
-                    sync_wallet(&rpc_client, &mut wallet, &mut store);
-                })
-            }
+            cmd_add(&secp, &db, network, &rpc_client, desc, start_height);
         }
         Commands::List => {
-            let mut found_dust = Vec::new();
-            for wallet_name in wallet_names(db.clone()) {
-                debug!("wallet: {}", wallet_name);
-                if let (Some(mut wallet), mut store) =
-                    load_wallet(db.clone(), network, wallet_name.clone())
-                {
-                    sync_wallet(&rpc_client, &mut wallet, &mut store);
-                    wallet.list_unspent().for_each(|out| {
-                        if is_dust(&out, &dust_amount) {
-                            let address = Address::from_script(&out.txout.script_pubkey, network)
-                                .expect("failed to get address")
-                                .to_string();
-                            let value = out.txout.value.to_sat() as u32;
-                            found_dust.push(Dust {
-                                address,
-                                value,
-                                outpoint: out.outpoint,
-                            });
-                        }
-                    });
-                } else {
-                    error!("could not load wallet with name {}", wallet_name);
-                }
-            }
-            println!("{}", serde_json::to_string_pretty(&found_dust).unwrap());
+            let dust = cmd_list(&db, network, &rpc_client, dust_amount);
+            println!("{}", serde_json::to_string_pretty(&dust).unwrap());
         }
         Commands::Spend { address } => {
             let filter_address = Address::from_str(&address)
                 .expect("failed to parse filter address")
                 .require_network(network)
                 .expect("invalid network");
-            for wallet_name in wallet_names(db.clone()) {
-                debug!("wallet: {}", wallet_name);
-                if let (Some(mut wallet), mut store) =
-                    load_wallet(db.clone(), network, wallet_name.clone())
-                {
-                    sync_wallet(&rpc_client, &mut wallet, &mut store);
-                    let dust = wallet
-                        .list_unspent()
-                        .filter_map(|out| {
-                            let out_address =
-                                Address::from_script(&out.txout.script_pubkey, network)
-                                    .expect("failed to get address");
-                            if is_dust(&out, &dust_amount) && filter_address == out_address {
-                                Some(out)
-                            } else {
-                                None
-                            }
-                        })
-                        .collect::<Vec<_>>();
-                    debug!("dust: {:?}", dust);
-                    if !dust.is_empty() {
-                        let mut input_amount: Amount = dust.iter().map(|out| out.txout.value).sum();
-                        let utxos = dust.iter().map(|out| out.outpoint).collect::<Vec<_>>();
-                        let unconfirmed_txs = find_unconfirmed_ddust_txs(&rpc_client);
-                        debug!("found {} unconfirmed ddust txs", unconfirmed_txs.len());
-
-                        let mut tx_builder = wallet.build_tx();
-
-                        tx_builder
-                            .nlocktime(LockTime::from_height(0).expect("valid height"))
-                            .manually_selected_only()
-                            .add_utxos(&utxos)
-                            .expect("failed to add dust outpoints");
-
-                        if !unconfirmed_txs.is_empty()
-                            && should_combine(
-                                &rpc_client,
-                                input_amount,
-                                &unconfirmed_txs,
-                                &dust,
-                                &unconfirmed_txs[0].output[0].script_pubkey,
-                            )
-                        {
-                            debug!("unconfirmed trs can be combined");
-                            // add inputs of unconfirmed txs
-                            for tx in &unconfirmed_txs {
-                                for input in &tx.input {
-                                    let f_outpoint = input.previous_output;
-                                    let f_input_prev_tx = rpc_client
-                                        .get_raw_transaction(&f_outpoint.txid, None)
-                                        .unwrap();
-                                    let f_prev_txout =
-                                        f_input_prev_tx.output[f_outpoint.vout as usize].clone();
-
-                                    input_amount += f_prev_txout.value;
-
-                                    let mut f_psbt_input = Input::default();
-                                    // p2tr sighash algorithm commits to all input amounts, thus
-                                    // non_witness_utxo is not needed to verify the input value
-                                    if f_prev_txout.script_pubkey.is_p2tr() {
-                                        f_psbt_input.witness_utxo = Some(f_prev_txout);
-                                    } else {
-                                        f_psbt_input.non_witness_utxo =
-                                            Some(f_input_prev_tx.clone());
-                                    }
-                                    if !input.witness.is_empty() {
-                                        f_psbt_input.final_script_witness =
-                                            Some(input.witness.clone());
-                                    }
-                                    if !input.script_sig.is_empty() {
-                                        f_psbt_input.final_script_sig =
-                                            Some(input.script_sig.clone());
-                                    }
-                                    tx_builder
-                                        .add_foreign_utxo_with_sequence(
-                                            f_outpoint,
-                                            f_psbt_input,
-                                            input.segwit_weight(),
-                                            input.sequence,
-                                        )
-                                        .unwrap_or_else(|_| {
-                                            panic!(
-                                                "failed to add the foreign UTXO. Outpoint: {}",
-                                                f_outpoint
-                                            )
-                                        });
-                                }
-                            }
-                        }
-                        debug!("total spent to fees: {}", &input_amount);
-                        tx_builder.fee_absolute(input_amount);
-
-                        if !unconfirmed_txs.is_empty() {
-                            // the new tx shall use the data found in the unconfirmed txs
-                            let suggested_script = &unconfirmed_txs[0].output[0].script_pubkey;
-                            let op_return = match suggested_script.as_bytes() {
-                                // empty OP_RETURN no data
-                                [0x6a, 0x00] => vec![],
-                                // skip 0x6a (OP_RETURN) and push byte
-                                [0x6a, _, rest @ ..] => rest.to_vec(),
-                                _ => vec![],
-                            };
-                            let data = PushBytesBuf::try_from(op_return).unwrap();
-                            tx_builder.add_data(&data);
-                        } else {
-                            // add op_return with data if single witness input, so Tx is 65vb
-                            if dust.len() == 1 && dust[0].txout.script_pubkey.is_witness_program() {
-                                let data =
-                                    PushBytesBuf::try_from("ash".as_bytes().to_vec()).unwrap();
-                                tx_builder.add_data(&data);
-                            } else {
-                                let data = PushBytesBuf::try_from(vec![]).unwrap();
-                                tx_builder.add_data(&data);
-                            }
-                        }
-
-                        // set script type to ANYONECANPAY|ALL
-                        if dust[0].txout.script_pubkey.is_p2tr() {
-                            tx_builder.sighash(TapSighashType::AllPlusAnyoneCanPay.into());
-                        } else {
-                            tx_builder.sighash(EcdsaSighashType::AllPlusAnyoneCanPay.into());
-                        }
-
-                        let psbt = tx_builder.finish().expect("failed to create psbt");
-                        println!("{}", psbt);
-                    }
-                } else {
-                    error!("could not load wallet with name {}", wallet_name);
-                }
+            if let Some(psbt) = cmd_spend(&db, network, &rpc_client, dust_amount, filter_address) {
+                println!("{}", psbt);
             }
         }
         Commands::Broadcast { psbt } => {
-            let tx = psbt
-                .extract_tx()
-                .expect("failed to extract transaction from PSBT");
-            let txid = rpc_client
-                .send_raw_transaction(&tx)
-                .expect("failed to broadcast transaction");
+            let txid = cmd_broadcast(&rpc_client, psbt);
             println!("{}", txid);
         }
     }
+}
+
+fn cmd_add(
+    secp: &Secp256k1<All>,
+    db: &Arc<Database>,
+    network: Network,
+    rpc_client: &Client,
+    desc: ExtendedDescriptor,
+    start_height: u32,
+) {
+    let wallet_name = wallet_name_from_descriptor(desc.clone(), None, network, secp)
+        .expect("must be a valid descriptor");
+
+    if let (Some(mut wallet), mut store) = load_wallet(db.clone(), network, wallet_name) {
+        sync_wallet(rpc_client, &mut wallet, &mut store);
+    } else {
+        let wallets = add_descriptor(secp, db.clone(), network, desc, start_height, rpc_client);
+        wallets.into_iter().for_each(|(mut wallet, mut store)| {
+            sync_wallet(rpc_client, &mut wallet, &mut store);
+        });
+    }
+}
+
+fn cmd_list(
+    db: &Arc<Database>,
+    network: Network,
+    rpc_client: &Client,
+    dust_amount: Amount,
+) -> Vec<Dust> {
+    let mut found_dust = Vec::new();
+    for wallet_name in wallet_names(db.clone()) {
+        debug!("wallet: {}", wallet_name);
+        if let (Some(mut wallet), mut store) = load_wallet(db.clone(), network, wallet_name.clone())
+        {
+            sync_wallet(rpc_client, &mut wallet, &mut store);
+            wallet.list_unspent().for_each(|out| {
+                if is_dust(&out, &dust_amount) {
+                    let address = Address::from_script(&out.txout.script_pubkey, network)
+                        .expect("failed to get address")
+                        .to_string();
+                    let value = out.txout.value.to_sat() as u32;
+                    found_dust.push(Dust {
+                        address,
+                        value,
+                        outpoint: out.outpoint,
+                    });
+                }
+            });
+        } else {
+            error!("could not load wallet with name {}", wallet_name);
+        }
+    }
+    found_dust
+}
+
+fn cmd_spend(
+    db: &Arc<Database>,
+    network: Network,
+    rpc_client: &Client,
+    dust_amount: Amount,
+    filter_address: Address,
+) -> Option<Psbt> {
+    for wallet_name in wallet_names(db.clone()) {
+        debug!("wallet: {}", wallet_name);
+        if let (Some(mut wallet), mut store) = load_wallet(db.clone(), network, wallet_name.clone())
+        {
+            sync_wallet(rpc_client, &mut wallet, &mut store);
+            let dust = wallet
+                .list_unspent()
+                .filter_map(|out| {
+                    let out_address = Address::from_script(&out.txout.script_pubkey, network)
+                        .expect("failed to get address");
+                    if is_dust(&out, &dust_amount) && filter_address == out_address {
+                        Some(out)
+                    } else {
+                        None
+                    }
+                })
+                .collect::<Vec<_>>();
+            debug!("dust: {:?}", dust);
+            if !dust.is_empty() {
+                let mut input_amount: Amount = dust.iter().map(|out| out.txout.value).sum();
+                let utxos = dust.iter().map(|out| out.outpoint).collect::<Vec<_>>();
+                let unconfirmed_txs = find_unconfirmed_ddust_txs(rpc_client);
+                debug!("found {} unconfirmed ddust txs", unconfirmed_txs.len());
+
+                let mut tx_builder = wallet.build_tx();
+                tx_builder
+                    .nlocktime(LockTime::from_height(0).expect("valid height"))
+                    .manually_selected_only()
+                    .add_utxos(&utxos)
+                    .expect("failed to add dust outpoints");
+
+                if !unconfirmed_txs.is_empty()
+                    && should_combine(
+                        rpc_client,
+                        input_amount,
+                        &unconfirmed_txs,
+                        &dust,
+                        &unconfirmed_txs[0].output[0].script_pubkey,
+                    )
+                {
+                    debug!("unconfirmed trs can be combined");
+                    for tx in &unconfirmed_txs {
+                        for input in &tx.input {
+                            let f_outpoint = input.previous_output;
+                            let f_input_prev_tx = rpc_client
+                                .get_raw_transaction(&f_outpoint.txid, None)
+                                .unwrap();
+                            let f_prev_txout =
+                                f_input_prev_tx.output[f_outpoint.vout as usize].clone();
+
+                            input_amount += f_prev_txout.value;
+
+                            let mut f_psbt_input = Input::default();
+                            // p2tr sighash algorithm commits to all input amounts, thus
+                            // non_witness_utxo is not needed to verify the input value
+                            if f_prev_txout.script_pubkey.is_p2tr() {
+                                f_psbt_input.witness_utxo = Some(f_prev_txout);
+                            } else {
+                                f_psbt_input.non_witness_utxo = Some(f_input_prev_tx.clone());
+                            }
+                            if !input.witness.is_empty() {
+                                f_psbt_input.final_script_witness = Some(input.witness.clone());
+                            }
+                            if !input.script_sig.is_empty() {
+                                f_psbt_input.final_script_sig = Some(input.script_sig.clone());
+                            }
+                            tx_builder
+                                .add_foreign_utxo_with_sequence(
+                                    f_outpoint,
+                                    f_psbt_input,
+                                    input.segwit_weight(),
+                                    input.sequence,
+                                )
+                                .unwrap_or_else(|_| {
+                                    panic!(
+                                        "failed to add the foreign UTXO. Outpoint: {}",
+                                        f_outpoint
+                                    )
+                                });
+                        }
+                    }
+                }
+
+                info!("total spent to fees: {}", &input_amount);
+                tx_builder.fee_absolute(input_amount);
+
+                if !unconfirmed_txs.is_empty() {
+                    // the new tx shall use the data found in the unconfirmed txs
+                    let suggested_script = &unconfirmed_txs[0].output[0].script_pubkey;
+                    let op_return = match suggested_script.as_bytes() {
+                        // empty OP_RETURN no data
+                        [0x6a, 0x00] => vec![],
+                        // skip 0x6a (OP_RETURN) and push byte
+                        [0x6a, _, rest @ ..] => rest.to_vec(),
+                        _ => vec![],
+                    };
+                    let data = PushBytesBuf::try_from(op_return).unwrap();
+                    tx_builder.add_data(&data);
+                } else {
+                    // add op_return with data if single witness input, so Tx is 65vb
+                    if dust.len() == 1 && dust[0].txout.script_pubkey.is_witness_program() {
+                        let data = PushBytesBuf::try_from("ash".as_bytes().to_vec()).unwrap();
+                        tx_builder.add_data(&data);
+                    } else {
+                        let data = PushBytesBuf::try_from(vec![]).unwrap();
+                        tx_builder.add_data(&data);
+                    }
+                }
+
+                // set script type to ANYONECANPAY|ALL
+                if dust[0].txout.script_pubkey.is_p2tr() {
+                    tx_builder.sighash(TapSighashType::AllPlusAnyoneCanPay.into());
+                } else {
+                    tx_builder.sighash(EcdsaSighashType::AllPlusAnyoneCanPay.into());
+                }
+
+                let psbt = tx_builder.finish().expect("failed to create psbt");
+                return Some(psbt);
+            }
+        } else {
+            error!("could not load wallet with name {}", wallet_name);
+        }
+    }
+    None
+}
+
+fn cmd_broadcast(rpc_client: &Client, psbt: Psbt) -> bdk_wallet::bitcoin::Txid {
+    let tx = psbt
+        .extract_tx()
+        .expect("failed to extract transaction from PSBT");
+    rpc_client
+        .send_raw_transaction(&tx)
+        .expect("failed to broadcast transaction")
 }
 
 /// A simple tool that finds and spends dust UTXOs in a privacy-preserving way

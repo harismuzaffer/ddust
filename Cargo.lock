@@ -392,10 +392,10 @@ dependencies = [
  "bdk_redb",
  "bdk_wallet",
  "clap",
- "serde",
- "serde_json",
  "corepc-client",
  "corepc-node",
+ "serde",
+ "serde_json",
  "tracing",
  "tracing-subscriber",
 ]
