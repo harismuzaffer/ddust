@@ -712,3 +712,45 @@ fn should_combine(
     );
     tx_fee_rate > max_fee_rate + 0.1
 }
+
+#[cfg(test)]
+mod test_env;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use test_env::TestEnv;
+    struct TestContext {
+        env: TestEnv,
+        db: Arc<Database>,
+        rpc_client: Client,
+        secp: Secp256k1<All>,
+        network: Network,
+        wallet1_name: String,
+    }
+
+    impl TestContext {
+        fn new() -> Self {
+            let env = TestEnv::new();
+            let network = Network::Regtest;
+            let db_file = env
+                .node
+                .workdir()
+                .join(format!("ddust-{}.redb", network.to_string().to_lowercase()));
+            let db = Arc::new(Database::create(db_file).expect("failed to open database"));
+            let rpc_client = env.rpc_client();
+            let secp = Secp256k1::new();
+            let wallet1_name = "wallet_1".to_string();
+            env.create_wallet(&wallet1_name);
+            Self {
+                env,
+                db,
+                rpc_client,
+                secp,
+                network,
+                wallet1_name,
+            }
+        }
+    }
+
+}
