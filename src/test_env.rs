@@ -2,7 +2,7 @@ use std::str::FromStr;
 
 use bdk_bitcoind_rpc::bitcoincore_rpc::{Auth, Client};
 use bdk_wallet::bitcoin::secp256k1::Secp256k1;
-use bdk_wallet::bitcoin::{Address, Amount, Psbt, Txid};
+use bdk_wallet::bitcoin::{Address, Amount, Psbt, PublicKey, Txid};
 use bdk_wallet::descriptor::ExtendedDescriptor;
 use bdk_wallet::serde_json::{self, json};
 use corepc_node::AddressType;
@@ -130,6 +130,44 @@ impl TestEnv {
             .unwrap();
     }
 
+    /// Create a `required`-of-N multisig address from the given wallets.
+    /// Returns the multisig address and its descriptor.
+    pub fn create_multisig(
+        &self,
+        wallet_names: &[&str],
+        required: usize,
+    ) -> (Address, ExtendedDescriptor) {
+        let pubkeys: Vec<PublicKey> = wallet_names
+            .iter()
+            .map(|name| {
+                let addr = self.new_address(name, &AddressType::Bech32);
+                let pubkey_hex = self
+                    .wallet_client(&name)
+                    .get_address_info(&addr)
+                    .unwrap()
+                    .pubkey
+                    .unwrap();
+                PublicKey::from_str(pubkey_hex.as_str()).unwrap()
+            })
+            .collect();
+
+        let result = self
+            .node
+            .client
+            .create_multisig(required as u32, pubkeys)
+            .unwrap();
+
+        let secp = Secp256k1::new();
+        let desc = ExtendedDescriptor::parse_descriptor(&secp, &result.descriptor)
+            .map(|(d, _)| d)
+            .unwrap();
+
+        (
+            Address::from_str(&result.address).unwrap().assume_checked(),
+            desc,
+        )
+    }
+
     /// Process and sign a PSBT using the given wallet.
     pub fn wallet_process_psbt(&self, wallet_name: &str, psbt: &Psbt) -> Psbt {
         let result = self
@@ -143,9 +181,7 @@ impl TestEnv {
                 ],
             )
             .unwrap();
-        let psbt_str = result["psbt"]
-            .as_str()
-            .unwrap();
+        let psbt_str = result["psbt"].as_str().unwrap();
         Psbt::from_str(psbt_str).unwrap()
     }
 }

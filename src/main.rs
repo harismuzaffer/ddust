@@ -726,7 +726,24 @@ mod test_env;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use corepc_node::AddressType;
     use test_env::TestEnv;
+
+    enum OpReturn {
+        Empty,
+        Ash,
+    }
+
+    impl OpReturn {
+        fn as_script(&self) -> ScriptBuf {
+            let data = match self {
+                OpReturn::Empty => PushBytesBuf::new(),
+                OpReturn::Ash => PushBytesBuf::try_from(b"ash".to_vec()).unwrap(),
+            };
+            ScriptBuf::new_op_return(data)
+        }
+    }
+
     struct TestContext {
         env: TestEnv,
         db: Arc<Database>,
@@ -734,12 +751,15 @@ mod tests {
         secp: Secp256k1<All>,
         network: Network,
         wallet1_name: String,
+        wallet2_name: String,
     }
 
     impl TestContext {
         fn new() -> Self {
             let mut conf = corepc_node::Conf::default();
             conf.args.push("-txindex");
+            // allows sending small amount of sats
+            conf.args.push("-dustrelayfee=0");
             let env = TestEnv::new_with_conf(conf);
             let network = Network::Regtest;
             let db_file = env
@@ -751,6 +771,8 @@ mod tests {
             let secp = Secp256k1::new();
             let wallet1_name = "wallet_1".to_string();
             env.create_wallet(&wallet1_name);
+            let wallet2_name = "wallet_2".to_string();
+            env.create_wallet(&wallet2_name);
             Self {
                 env,
                 db,
@@ -758,8 +780,378 @@ mod tests {
                 secp,
                 network,
                 wallet1_name,
+                wallet2_name,
             }
         }
     }
 
+    /// Add descriptors for multiple address types, send dust and non-dust UTXOs,
+    /// verify cmd_list only returns UTXOs at or below the dust threshold.
+    #[test]
+    fn test_cmd_add_list() {
+        let ctx = TestContext::new();
+
+        let desc = ctx
+            .env
+            .get_descriptor(&ctx.wallet1_name, &AddressType::Bech32m);
+        cmd_add(&ctx.secp, &ctx.db, ctx.network, &ctx.rpc_client, desc, 0);
+        let desc = ctx
+            .env
+            .get_descriptor(&ctx.wallet1_name, &AddressType::Bech32);
+        cmd_add(&ctx.secp, &ctx.db, ctx.network, &ctx.rpc_client, desc, 0);
+        let desc = ctx
+            .env
+            .get_descriptor(&ctx.wallet1_name, &AddressType::Legacy);
+        cmd_add(&ctx.secp, &ctx.db, ctx.network, &ctx.rpc_client, desc, 0);
+        let dust_sats = Amount::from_sat(555);
+
+        let addr1 = ctx
+            .env
+            .new_address(&ctx.wallet1_name, &AddressType::Bech32m);
+        // dust UTXO 1
+        ctx.env.send_to_address(&addr1, Amount::from_sat(400));
+        // non dust UTXO
+        ctx.env.send_to_address(&addr1, Amount::from_sat(700));
+        // dust UTXO 2
+        ctx.env.send_to_address(&addr1, Amount::from_sat(401));
+        let addr2 = ctx.env.new_address(&ctx.wallet1_name, &AddressType::Bech32);
+        // dust UTXO 3
+        ctx.env.send_to_address(&addr2, Amount::from_sat(500));
+        let addr3 = ctx.env.new_address(&ctx.wallet1_name, &AddressType::Legacy);
+        // dust UTXO 4
+        ctx.env.send_to_address(&addr3, Amount::from_sat(546));
+        // non-dust UTXO
+        ctx.env.send_to_address(&addr3, Amount::from_sat(600));
+
+        ctx.env.mine_blocks(1);
+        let dust = cmd_list(&ctx.db, ctx.network, &ctx.rpc_client, dust_sats);
+        assert_eq!(dust.len(), 4);
+    }
+
+    /// Add a descriptor with start_height > 0 and verify that dust sent
+    /// before that height is not found by cmd_list.
+    #[test]
+    fn test_cmd_add_start_height() {
+        let ctx = TestContext::new();
+        let dust_sats = Amount::from_sat(555);
+        let start_height = 103;
+
+        let addr = ctx
+            .env
+            .new_address(&ctx.wallet1_name, &AddressType::Bech32m);
+
+        // block 102. send dust before start_height
+        ctx.env.send_to_address(&addr, Amount::from_sat(400));
+        ctx.env.mine_blocks(1);
+
+        // block 103. send dusts after start_height
+        ctx.env.send_to_address(&addr, Amount::from_sat(401));
+        ctx.env.mine_blocks(1);
+        // block 104
+        ctx.env.send_to_address(&addr, Amount::from_sat(402));
+        ctx.env.mine_blocks(1);
+
+        // add descriptor with start_height=103, should skip block 102
+        let desc = ctx
+            .env
+            .get_descriptor(&ctx.wallet1_name, &AddressType::Bech32m);
+        cmd_add(
+            &ctx.secp,
+            &ctx.db,
+            ctx.network,
+            &ctx.rpc_client,
+            desc,
+            start_height,
+        );
+
+        let dust = cmd_list(&ctx.db, ctx.network, &ctx.rpc_client, dust_sats);
+        assert_eq!(
+            dust.len(),
+            2,
+            "should only find dust sent at or after start_height"
+        );
+    }
+
+    /// Send one confirmed and one unconfirmed dust UTXO, verify cmd_list
+    /// only returns the confirmed one.
+    #[test]
+    fn test_cmd_list_unconfirmed_dust() {
+        let ctx = TestContext::new();
+        let dust_sats = Amount::from_sat(555);
+
+        let addr = ctx
+            .env
+            .new_address(&ctx.wallet1_name, &AddressType::Bech32m);
+
+        // send dust and confirm the tx
+        ctx.env.send_to_address(&addr, Amount::from_sat(400));
+        ctx.env.mine_blocks(1);
+
+        // send dust but do not confirm the tx
+        ctx.env.send_to_address(&addr, Amount::from_sat(401));
+
+        let desc = ctx
+            .env
+            .get_descriptor(&ctx.wallet1_name, &AddressType::Bech32m);
+        cmd_add(&ctx.secp, &ctx.db, ctx.network, &ctx.rpc_client, desc, 0);
+
+        let dust = cmd_list(&ctx.db, ctx.network, &ctx.rpc_client, dust_sats);
+        assert_eq!(dust.len(), 1, "should only find confirmed dust utxos");
+    }
+
+    fn broadcast_and_assert(
+        ctx: &TestContext,
+        psbt: Psbt,
+        expected_inputs: usize,
+        expected_op_return: OpReturn,
+    ) {
+        let txid = cmd_broadcast(&ctx.rpc_client, psbt);
+        let tx = ctx
+            .env
+            .node
+            .client
+            .get_raw_transaction(txid)
+            .unwrap()
+            .transaction()
+            .unwrap();
+        assert!(is_ddust_tx(&tx, &None));
+        assert_eq!(tx.input.len(), expected_inputs);
+        assert_eq!(tx.output.len(), 1);
+        assert_eq!(tx.output[0].script_pubkey, expected_op_return.as_script());
+    }
+
+    fn run_spend_test(
+        addr_type: &AddressType,
+        dust_sats: u64,
+        utxo_count: usize,
+        expected_op_return: OpReturn,
+    ) {
+        let ctx = TestContext::new();
+
+        let desc = ctx.env.get_descriptor(&ctx.wallet1_name, addr_type);
+        cmd_add(&ctx.secp, &ctx.db, ctx.network, &ctx.rpc_client, desc, 0);
+
+        let addr = ctx.env.new_address(&ctx.wallet1_name, addr_type);
+        let send_amt = match addr_type {
+            AddressType::Legacy | AddressType::P2shSegwit => 555,
+            _ => 400,
+        };
+
+        for _ in 0..utxo_count {
+            ctx.env.send_to_address(&addr, Amount::from_sat(send_amt));
+        }
+        ctx.env.mine_blocks(1);
+
+        let result = cmd_spend(
+            &ctx.db,
+            ctx.network,
+            &ctx.rpc_client,
+            Amount::from_sat(dust_sats),
+            addr,
+        );
+        assert!(result.is_some(), "expected a psbt to be created");
+
+        let psbt = result.unwrap();
+        let signed = ctx.env.wallet_process_psbt(&ctx.wallet1_name, &psbt);
+        broadcast_and_assert(&ctx, signed, utxo_count, expected_op_return);
+    }
+
+    /// Spending a single non-witness (Legacy, P2SH-SegWit) dust UTXO produces an empty OP_RETURN.
+    #[test]
+    fn test_spend_single_non_witness() {
+        run_spend_test(&AddressType::Legacy, 600, 1, OpReturn::Empty);
+        run_spend_test(&AddressType::P2shSegwit, 600, 1, OpReturn::Empty);
+    }
+
+    /// Spending a single witness (Bech32m/P2TR) dust UTXO produces an "ash" OP_RETURN.
+    #[test]
+    fn test_spend_single_witness() {
+        run_spend_test(&AddressType::Bech32m, 546, 1, OpReturn::Ash);
+    }
+
+    /// Spending multiple dust UTXOs always produces an empty OP_RETURN regardless of script type.
+    #[test]
+    fn test_spend_multiple_utxos() {
+        // multiple UTXOs always produce empty OP_RETURN regardless of script type or sig count
+        run_spend_test(&AddressType::Legacy, 600, 3, OpReturn::Empty);
+        run_spend_test(&AddressType::Bech32m, 546, 3, OpReturn::Empty);
+    }
+
+    /// cmd_spend returns None when the address has no dust UTXOs (amount above threshold).
+    #[test]
+    fn test_non_dust_spend() {
+        let ctx = TestContext::new();
+        let dust_sats = Amount::from_sat(600);
+
+        let desc = ctx
+            .env
+            .get_descriptor(&ctx.wallet1_name, &AddressType::Bech32);
+        cmd_add(&ctx.secp, &ctx.db, ctx.network, &ctx.rpc_client, desc, 0);
+
+        let addr = ctx
+            .env
+            .new_address(&ctx.wallet1_name, &AddressType::Bech32m);
+        // non dust UTXO created
+        ctx.env.send_to_address(&addr, Amount::from_sat(1500));
+        ctx.env.mine_blocks(1);
+
+        let result = cmd_spend(&ctx.db, ctx.network, &ctx.rpc_client, dust_sats, addr);
+        assert!(result.is_none(), "expected no Psbt created");
+    }
+
+    /// Spend a 2-of-2 P2SH multisig dust UTXO, produces OpReturn::Empty
+    #[test]
+    fn test_spend_multisig() {
+        let ctx = TestContext::new();
+
+        let (addr, desc) = ctx
+            .env
+            .create_multisig(&[&ctx.wallet1_name, &ctx.wallet2_name], 2);
+
+        cmd_add(&ctx.secp, &ctx.db, ctx.network, &ctx.rpc_client, desc, 0);
+        ctx.env.send_to_address(&addr, Amount::from_sat(555));
+        ctx.env.mine_blocks(1);
+
+        let result = cmd_spend(
+            &ctx.db,
+            ctx.network,
+            &ctx.rpc_client,
+            Amount::from_sat(600),
+            addr,
+        );
+        assert!(result.is_some(), "expected a psbt to be created");
+        let psbt = result.unwrap();
+
+        // 2-of-2: both wallets must sign
+        let partially_signed = ctx.env.wallet_process_psbt(&ctx.wallet1_name, &psbt);
+        let fully_signed = ctx
+            .env
+            .wallet_process_psbt(&ctx.wallet2_name, &partially_signed);
+        broadcast_and_assert(&ctx, fully_signed, 1, OpReturn::Empty);
+    }
+
+    /// Test combining ddust txs via RBF:
+    /// 1. Empty OP_RETURN combine (Legacy + Bech32m)
+    /// 2. Ash OP_RETURN combine (Bech32m + Bech32m)
+    /// 3. No combine when fee rate is insufficient for RBF
+    #[test]
+    fn test_spend_combine() {
+        fn min_sats_for_combine(amt1: Amount, first_tx_size: f64, new_input_size: f64) -> Amount {
+            let fee_rate = amt1.to_sat() as f64 / first_tx_size;
+            let fee_rate_valid_rbf = fee_rate + 0.10;
+            Amount::from_sat((fee_rate_valid_rbf * (first_tx_size + new_input_size)) as u64) - amt1
+        }
+
+        let ctx = TestContext::new();
+        let dust_sats = Amount::from_sat(600);
+
+        let desc = ctx
+            .env
+            .get_descriptor(&ctx.wallet1_name, &AddressType::Legacy);
+        cmd_add(&ctx.secp, &ctx.db, ctx.network, &ctx.rpc_client, desc, 0);
+        let desc = ctx
+            .env
+            .get_descriptor(&ctx.wallet1_name, &AddressType::Bech32m);
+        cmd_add(&ctx.secp, &ctx.db, ctx.network, &ctx.rpc_client, desc, 0);
+        let desc = ctx
+            .env
+            .get_descriptor(&ctx.wallet2_name, &AddressType::Legacy);
+        cmd_add(&ctx.secp, &ctx.db, ctx.network, &ctx.rpc_client, desc, 0);
+        let desc = ctx
+            .env
+            .get_descriptor(&ctx.wallet2_name, &AddressType::Bech32m);
+        cmd_add(&ctx.secp, &ctx.db, ctx.network, &ctx.rpc_client, desc, 0);
+
+        // Case: Expect OpReturn::Empty
+        let addr1 = ctx.env.new_address(&ctx.wallet1_name, &AddressType::Legacy);
+        let amt1 = Amount::from_sat(555);
+        ctx.env.send_to_address(&addr1, amt1);
+        let addr2 = ctx
+            .env
+            .new_address(&ctx.wallet2_name, &AddressType::Bech32m);
+        // first tx: overhead + P2PKH input + empty OP_RETURN
+        let first_tx_size = 10.5 + 148.0 + 11.0;
+        let min_sats = min_sats_for_combine(amt1, first_tx_size, 57.5);
+        ctx.env
+            .send_to_address(&addr2, min_sats + Amount::from_sat(10));
+        ctx.env.mine_blocks(1);
+
+        // first tx
+        let result = cmd_spend(&ctx.db, ctx.network, &ctx.rpc_client, dust_sats, addr1);
+        assert!(result.is_some(), "expected a psbt to be created");
+
+        let psbt = result.unwrap();
+        let signed = ctx.env.wallet_process_psbt(&ctx.wallet1_name, &psbt);
+        broadcast_and_assert(&ctx, signed, 1, OpReturn::Empty);
+
+        // spend addr2 and expect combine of the mempool ddust tx
+        let result_combine = cmd_spend(&ctx.db, ctx.network, &ctx.rpc_client, dust_sats, addr2);
+        assert!(result_combine.is_some(), "expected a psbt to be created");
+
+        let psbt = result_combine.unwrap();
+        let signed = ctx.env.wallet_process_psbt(&ctx.wallet2_name, &psbt);
+        // the orignal tx output of OpReturn::Empty is preserved
+        broadcast_and_assert(&ctx, signed.clone(), 2, OpReturn::Empty);
+        ctx.env.mine_blocks(1);
+
+        // Case: Expect OpReturn::Ash
+        let addr1 = ctx
+            .env
+            .new_address(&ctx.wallet1_name, &AddressType::Bech32m);
+        let amt1 = Amount::from_sat(400);
+        ctx.env.send_to_address(&addr1, amt1);
+        let addr2 = ctx
+            .env
+            .new_address(&ctx.wallet2_name, &AddressType::Bech32m);
+        // first tx: overhead + P2TR input + ash OP_RETURN
+        let first_tx_size = 10.5 + 57.5 + 14.0;
+        let min_sats = min_sats_for_combine(amt1, first_tx_size, 57.5);
+        ctx.env
+            .send_to_address(&addr2, min_sats + Amount::from_sat(10));
+        ctx.env.mine_blocks(1);
+
+        // first tx: spend addr1
+        let psbt = cmd_spend(&ctx.db, ctx.network, &ctx.rpc_client, dust_sats, addr1).unwrap();
+        let signed = ctx.env.wallet_process_psbt(&ctx.wallet1_name, &psbt);
+        broadcast_and_assert(&ctx, signed, 1, OpReturn::Ash);
+
+        // spend addr2 and expect combine of the mempool ddust tx
+        let psbt_combined =
+            cmd_spend(&ctx.db, ctx.network, &ctx.rpc_client, dust_sats, addr2).unwrap();
+        let signed = ctx
+            .env
+            .wallet_process_psbt(&ctx.wallet2_name, &psbt_combined);
+        // the orignal tx output of OpReturn::Ash is preserved
+        broadcast_and_assert(&ctx, signed, 2, OpReturn::Ash);
+
+        // Case: Expect no combine
+        let addr1 = ctx
+            .env
+            .new_address(&ctx.wallet1_name, &AddressType::Bech32m);
+        let amt1 = Amount::from_sat(400);
+        ctx.env.send_to_address(&addr1, amt1);
+        let addr2 = ctx
+            .env
+            .new_address(&ctx.wallet2_name, &AddressType::Bech32m);
+        // first tx: overhead + P2TR input + ash OP_RETURN
+        let first_tx_size = 10.5 + 57.5 + 14.0;
+        let min_sats = min_sats_for_combine(amt1, first_tx_size, 57.5);
+        // send less than min_sats to prevent a valid RBF
+        ctx.env
+            .send_to_address(&addr2, min_sats - Amount::from_sat(10));
+        ctx.env.mine_blocks(1);
+
+        let psbt = cmd_spend(&ctx.db, ctx.network, &ctx.rpc_client, dust_sats, addr1).unwrap();
+        let signed = ctx.env.wallet_process_psbt(&ctx.wallet1_name, &psbt);
+        broadcast_and_assert(&ctx, signed, 1, OpReturn::Ash);
+
+        // spend addr2 and expect this tx doesnt replace the original tx because new fee rate is
+        // not sufficient to replace the mempool tx
+        let psbt_combined =
+            cmd_spend(&ctx.db, ctx.network, &ctx.rpc_client, dust_sats, addr2).unwrap();
+        let signed = ctx
+            .env
+            .wallet_process_psbt(&ctx.wallet2_name, &psbt_combined);
+        broadcast_and_assert(&ctx, signed, 1, OpReturn::Ash);
+    }
 }
