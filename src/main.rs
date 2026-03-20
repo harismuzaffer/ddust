@@ -719,7 +719,9 @@ mod test_env;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use corepc_node::AddressType;
     use test_env::TestEnv;
+
     struct TestContext {
         env: TestEnv,
         db: Arc<Database>,
@@ -753,4 +755,48 @@ mod tests {
         }
     }
 
+    fn run_spend_test(addr_type: &AddressType, dust_sats: u64, expected_op_return: &[u8]) {
+        let ctx = TestContext::new();
+
+        let desc = ctx.env.get_descriptor(&ctx.wallet1_name, addr_type);
+        cmd_add(&ctx.secp, &ctx.db, ctx.network, &ctx.rpc_client, desc, 0);
+
+        let addr = ctx.env.new_address(&ctx.wallet1_name, addr_type);
+        ctx.env.send_to_address(&addr, Amount::from_sat(dust_sats));
+        ctx.env.mine_blocks(1);
+
+        let psbts = cmd_spend(
+            &ctx.db,
+            ctx.network,
+            &ctx.rpc_client,
+            Amount::from_sat(dust_sats),
+            addr,
+        );
+        assert!(!psbts.is_empty(), "expected a psbt to be created");
+
+        let signed = ctx.env.wallet_process_psbt(&ctx.wallet1_name, &psbts[0]);
+        let txid = cmd_broadcast(&ctx.rpc_client, signed);
+        let tx = ctx
+            .env
+            .node
+            .client
+            .get_raw_transaction(txid)
+            .unwrap()
+            .transaction()
+            .unwrap();
+
+        assert!(is_ddust_tx(&tx, &None));
+        assert_eq!(tx.output.len(), 1);
+        assert_eq!(tx.output[0].script_pubkey.as_bytes(), expected_op_return);
+    }
+
+    #[test]
+    fn test_spend_legacy() {
+        run_spend_test(&AddressType::Legacy, 546, &[0x6a, 0x00]);
+    }
+
+    #[test]
+    fn test_spend_single() {
+        run_spend_test(&AddressType::Bech32m, 400, &[0x6a, 0x03, 0x61, 0x73, 0x68]);
+    }
 }
