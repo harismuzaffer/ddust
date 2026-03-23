@@ -96,6 +96,39 @@ Bubb1es reviewed my PR and suggested that i should have fewer commits without in
 - Open issue for dust attack detection (Sidharth)
 - Schedule sync with bubb1es
 
+---
+
+## [23.03.2026] - Test scenarios
+
+### In Progress
+- [Issue #8](https://github.com/bubb1es71/ddust/issues/8) - Add test scenarios
+ 
+### Collaboration
+- [x] Raised [PR #17](https://github.com/bubb1es71/ddust/pull/17): Setup TestEnv and add tests for add, list and spend scenarios. Nearly covers the entire code base
+- [x] Reviewed Bubbl1es [PR #16](https://github.com/bubb1es71/dusts/pull/16) that returns simple output JSON values for dust list to enable `jq` on the output
+
+### Journal
+- We needed a way to enable testing `ddust` commands relying on `bitcoind`. Bubb1es can across this PR https://github.com/bitcoindevkit/rust-esplora-client/pull/176 that creates a small custom `TestEnv` instantiated per-test. This PR relies on `corepc` https://crates.io/crates/corepc-node for `bitcoind` node setup
+- I went ahead and wrote a similar custom `TestEnv` wrapping `corepc_node::Node` with helpers for wallet creation, descriptor extraction, address generation, mining, multisig, and PSBT signing with `SIGHASH_ALL|ANYONECANPAY`. Our TestEnv didn't need `electrsd` and thus was relatively simpler
+- I also added `TestContext` struct for shared test setup (regtest node with `-txindex` and `-dustrelayfee=0`). This is the minimal common setup that out tests would need
+- Extracted command logic from `main()` match arms into standalone functions (`cmd_add`, `cmd_list`, `cmd_spend`, `cmd_broadcast`). This also enabled us to test our functionalities
+- Added test scenarios:
+  - **Add + List**: dust filtering across multiple address types (P2TR, P2WPKH, P2PKH)
+  - **Add with start_height**: wallet only finds dust sent at or after the given block height
+  - **Unconfirmed dust ignored**: cmd_list skips unconfirmed UTXOs
+  - **Single non-witness spend**: Legacy and P2SH-SegWit produce empty OP_RETURN because the tx size is already sufficient for relaying
+  - **Single witness spend**: Bech32m (P2TR) produces "ash" OP_RETURN because tx size is less than the minimum relay size
+  - **Multiple UTXOs spend**: multiple inputs always produce empty OP_RETURN
+  - **Multisig spend**: 2-of-2 P2SH multisig with both wallets signing
+  - **Non-dust spend**: cmd_spend returns None when UTXO is above dust threshold i.e. there is no dust in the wallet
+  - **Combine**: valid RBF combine preserves original OP_RETURN type (Empty and Ash), no-combine when fee rate is insufficient. The thing with combine feature is that it finds unconfirmed txs in the mempool and replaces it with a new tx with new dust UTXOs added, possible because of `SIGHASH_ALL|ANYONECANPAY`
+- Updated GitHub Actions workflow to download bitcoind for CI test runs
+
+### Next Steps
+- Bubbl1es reviews the [PR #17](https://github.com/bubb1es71/ddust/pull/17) and merges it
+
+---
+
 ### Ideas Backlog
 | Feature                        | Description                                                                  | Comments                                                            |
 |--------------------------------|------------------------------------------------------------------------------|---------------------------------------------------------------------|
