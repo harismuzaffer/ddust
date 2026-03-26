@@ -22,7 +22,7 @@ Now that the default minimum relay fee rate (as of core 30) has been lowered to 
 - **Privacy-focused**: Only consolidates dust size UTXOs sent to the same wallet address
 - **Persistent storage**: Uses redb for efficient wallet state management
 - **Bitcoin Core integration**: Syncs directly with Bitcoin Core via RPC
-- **Mempool combining**: Automatically detects and combines unconfirmed ddust transactions via RBF
+- **Mempool batching**: Automatically detects and batch unconfirmed ddust transactions via RBF
 
 ## Installation
 
@@ -56,9 +56,9 @@ Options:
   -V, --version                    Print version
 ```
 
-## Mempool Combining
+## Mempool Batching
 
-When running `spend`, ddust scans the mempool for existing unconfirmed ddust transactions - identified by a single OP_RETURN output and inputs signed with `SIGHASH_ALL|ANYONECANPAY`. If matching transactions are found, ddust checks whether combining them with the new dust inputs would satisfy RBF replacement rules: the combined fee rate must exceed the highest existing ddust transaction fee rate by at least 0.1 sat/vB.
+When running `spend`, ddust scans the mempool for existing unconfirmed ddust transactions identified by a single OP_RETURN output and inputs signed with `SIGHASH_ALL|ANYONECANPAY`. If matching transactions are found, ddust checks whether batching them with the new dust inputs would satisfy RBF replacement rules: the combined fee rate must exceed the highest existing ddust transaction fee rate by at least 0.1 sat/vB.
 
 If the check passes, ddust builds a single replacement transaction that:
 

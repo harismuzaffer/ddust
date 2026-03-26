@@ -172,7 +172,7 @@ fn cmd_spend(
                     .expect("failed to add dust outpoints");
 
                 if !unconfirmed_txs.is_empty()
-                    && should_combine(
+                    && should_batch(
                         rpc_client,
                         input_amount,
                         &unconfirmed_txs,
@@ -180,7 +180,7 @@ fn cmd_spend(
                         &unconfirmed_txs[0].output[0].script_pubkey,
                     )
                 {
-                    debug!("unconfirmed trs can be combined");
+                    debug!("unconfirmed txs can be batched");
                     for tx in &unconfirmed_txs {
                         for input in &tx.input {
                             let f_outpoint = input.previous_output;
@@ -546,7 +546,7 @@ fn find_unconfirmed_ddust_txs(rpc_client: &Client) -> Vec<Transaction> {
         .get_raw_mempool()
         .expect("failed to get mempool transaction IDs");
     let mut unconfirmed_txs: Vec<Transaction> = vec![];
-    // the combined tx shall use the first unconfirmed tx's script data
+    // the batch tx shall use the first unconfirmed tx's script data
     let mut first_found_script: Option<Vec<u8>> = None;
 
     // find txs in the mempool that match ddust pattern
@@ -660,10 +660,10 @@ fn is_dust(out: &LocalOutput, dust_amount: &Amount) -> bool {
     !out.is_spent && out.txout.value <= *dust_amount && out.chain_position.is_confirmed()
 }
 
-/// Checks if combining dust inputs with existing ddust transactions in the mempool
+/// Checks if batching dust inputs with existing ddust transactions in the mempool
 /// produces a fee rate at least 1 sat/vB higher than the highest existing fee rate,
 /// as required by RBF replacement rules.
-fn should_combine(
+fn should_batch(
     rpc_client: &Client,
     this_amount: Amount,
     unconfirmed_txs: &Vec<Transaction>,
@@ -712,7 +712,7 @@ fn should_combine(
 
     let tx_fee_rate = input_amount.to_sat() as f64 / tx_vsize;
     debug!(
-        "tx_fee_rate: {}, max_fee_rate: {}, combine? {}",
+        "tx_fee_rate: {}, max_fee_rate: {}, batch? {}",
         tx_fee_rate,
         max_fee_rate,
         tx_fee_rate > max_fee_rate + 0.1
@@ -1030,13 +1030,13 @@ mod tests {
         broadcast_and_assert(&ctx, fully_signed, 1, OpReturn::Empty);
     }
 
-    /// Test combining ddust txs via RBF:
-    /// 1. Empty OP_RETURN combine (Legacy + Bech32m)
-    /// 2. Ash OP_RETURN combine (Bech32m + Bech32m)
-    /// 3. No combine when fee rate is insufficient for RBF
+    /// Test batching ddust txs via RBF:
+    /// 1. Empty OP_RETURN batch (Legacy + Bech32m)
+    /// 2. Ash OP_RETURN batch (Bech32m + Bech32m)
+    /// 3. No batching when fee rate is insufficient for RBF
     #[test]
-    fn test_spend_combine() {
-        fn min_sats_for_combine(amt1: Amount, first_tx_size: f64, new_input_size: f64) -> Amount {
+    fn test_spend_batch() {
+        fn min_sats_for_batching(amt1: Amount, first_tx_size: f64, new_input_size: f64) -> Amount {
             let fee_rate = amt1.to_sat() as f64 / first_tx_size;
             let fee_rate_valid_rbf = fee_rate + 0.10;
             Amount::from_sat((fee_rate_valid_rbf * (first_tx_size + new_input_size)) as u64) - amt1
@@ -1071,7 +1071,7 @@ mod tests {
             .new_address(&ctx.wallet2_name, &AddressType::Bech32m);
         // first tx: overhead + P2PKH input + empty OP_RETURN
         let first_tx_size = 10.5 + 148.0 + 11.0;
-        let min_sats = min_sats_for_combine(amt1, first_tx_size, 57.5);
+        let min_sats = min_sats_for_batching(amt1, first_tx_size, 57.5);
         ctx.env
             .send_to_address(&addr2, min_sats + Amount::from_sat(10));
         ctx.env.mine_blocks(1);
@@ -1084,11 +1084,11 @@ mod tests {
         let signed = ctx.env.wallet_process_psbt(&ctx.wallet1_name, &psbt);
         broadcast_and_assert(&ctx, signed, 1, OpReturn::Empty);
 
-        // spend addr2 and expect combine of the mempool ddust tx
-        let result_combine = cmd_spend(&ctx.db, ctx.network, &ctx.rpc_client, dust_sats, addr2);
-        assert!(result_combine.is_some(), "expected a psbt to be created");
+        // spend addr2 and expect batch of the mempool ddust tx
+        let result_batch = cmd_spend(&ctx.db, ctx.network, &ctx.rpc_client, dust_sats, addr2);
+        assert!(result_batch.is_some(), "expected a psbt to be created");
 
-        let psbt = result_combine.unwrap();
+        let psbt = result_batch.unwrap();
         let signed = ctx.env.wallet_process_psbt(&ctx.wallet2_name, &psbt);
         // the orignal tx output of OpReturn::Empty is preserved
         broadcast_and_assert(&ctx, signed.clone(), 2, OpReturn::Empty);
@@ -1105,7 +1105,7 @@ mod tests {
             .new_address(&ctx.wallet2_name, &AddressType::Bech32m);
         // first tx: overhead + P2TR input + ash OP_RETURN
         let first_tx_size = 10.5 + 57.5 + 14.0;
-        let min_sats = min_sats_for_combine(amt1, first_tx_size, 57.5);
+        let min_sats = min_sats_for_batching(amt1, first_tx_size, 57.5);
         ctx.env
             .send_to_address(&addr2, min_sats + Amount::from_sat(10));
         ctx.env.mine_blocks(1);
@@ -1115,16 +1115,16 @@ mod tests {
         let signed = ctx.env.wallet_process_psbt(&ctx.wallet1_name, &psbt);
         broadcast_and_assert(&ctx, signed, 1, OpReturn::Ash);
 
-        // spend addr2 and expect combine of the mempool ddust tx
-        let psbt_combined =
+        // spend addr2 and expect batch of the mempool ddust tx
+        let psbt_batched =
             cmd_spend(&ctx.db, ctx.network, &ctx.rpc_client, dust_sats, addr2).unwrap();
         let signed = ctx
             .env
-            .wallet_process_psbt(&ctx.wallet2_name, &psbt_combined);
+            .wallet_process_psbt(&ctx.wallet2_name, &psbt_batched);
         // the orignal tx output of OpReturn::Ash is preserved
         broadcast_and_assert(&ctx, signed, 2, OpReturn::Ash);
 
-        // Case: Expect no combine
+        // Case: Expect no batching
         let addr1 = ctx
             .env
             .new_address(&ctx.wallet1_name, &AddressType::Bech32m);
@@ -1135,7 +1135,7 @@ mod tests {
             .new_address(&ctx.wallet2_name, &AddressType::Bech32m);
         // first tx: overhead + P2TR input + ash OP_RETURN
         let first_tx_size = 10.5 + 57.5 + 14.0;
-        let min_sats = min_sats_for_combine(amt1, first_tx_size, 57.5);
+        let min_sats = min_sats_for_batching(amt1, first_tx_size, 57.5);
         // send less than min_sats to prevent a valid RBF
         ctx.env
             .send_to_address(&addr2, min_sats - Amount::from_sat(10));
@@ -1147,11 +1147,11 @@ mod tests {
 
         // spend addr2 and expect this tx doesnt replace the original tx because new fee rate is
         // not sufficient to replace the mempool tx
-        let psbt_combined =
+        let psbt_batched =
             cmd_spend(&ctx.db, ctx.network, &ctx.rpc_client, dust_sats, addr2).unwrap();
         let signed = ctx
             .env
-            .wallet_process_psbt(&ctx.wallet2_name, &psbt_combined);
+            .wallet_process_psbt(&ctx.wallet2_name, &psbt_batched);
         broadcast_and_assert(&ctx, signed, 1, OpReturn::Ash);
     }
 }
