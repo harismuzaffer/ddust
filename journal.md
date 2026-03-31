@@ -129,6 +129,28 @@ Bubb1es reviewed my PR and suggested that i should have fewer commits without in
 
 ---
 
+## [28.03.2026] - Test PR merged, BIP draft
+
+### Merged
+- [x] [PR #17](https://github.com/bubb1es71/ddust/pull/17) - Setup TestEnv and add tests for add, list and spend scenarios
+
+### In Review
+- [PR #20](https://github.com/bubb1es71/ddust/pull/20) - BIP draft for dust disposal protocol
+
+### Collaboration
+- [x] Reviewed bubb1es' [BIP draft](https://github.com/bubb1es71/ddust/pull/20) for the dust disposal protocol. Provided feedback on transaction size tables (incorrect values for P2PKH, missing P2WPKH and P2TR columns), and corrected the fee rate table
+- [x] bubb1es shared the BIP update on Delving Bitcoin: [post #20](https://delvingbitcoin.org/t/disposing-of-dust-attack-utxos/2215/20)
+
+### Journal
+The test PR just merged,  paved the way for drafting a BIP. Having comprehensive test scenarios and a well-tested reference implementation gave us the confidence to formalize the protocol. Bubb1es wrote the initial BIP draft covering transaction format, signature conventions (`SIGHASH_ALL|ANYONECANPAY`), batching via RBF, and privacy considerations. I reviewed it and suggest few changes in the transaction size table and the fee rate table. A BIP would be a major step forward for the project - it turns a CLI tool into a standardized protocol that any wallet can implement. The BIP draft is open to any possible fixes, enhancement or feedback on [Delving Bitcoin](https://delvingbitcoin.org/t/disposing-of-dust-attack-utxos/2215/20)
+
+As part of the Test Env setup, i also updated the docs for "Mempool batching"
+
+### Next Steps
+- Address BIP review feedback and iterate on [PR #20](https://github.com/bubb1es71/ddust/pull/20)
+
+---
+
 ### Ideas Backlog
 | Feature                        | Description                                                                  | Comments                                                            |
 |--------------------------------|------------------------------------------------------------------------------|---------------------------------------------------------------------|
