@@ -58,7 +58,7 @@ Options:
 
 ## Mempool Batching
 
-When running `spend`, ddust scans the mempool for existing unconfirmed ddust transactions identified by a single OP_RETURN output and inputs signed with `SIGHASH_ALL|ANYONECANPAY`. If matching transactions are found, ddust checks whether batching them with the new dust inputs would satisfy RBF replacement rules: the combined fee rate must exceed the highest existing ddust transaction fee rate by at least 0.1 sat/vB.
+When running `spend`, ddust scans the mempool for existing unconfirmed ddust transactions identified by a single OP_RETURN output and inputs signed with `SIGHASH_NONE|ANYONECANPAY`. If matching transactions are found, ddust checks whether batching them with the new dust inputs would satisfy RBF replacement rules: the combined fee rate must exceed the highest existing ddust transaction fee rate by at least 0.1 sat/vB.
 
 If the check passes, ddust builds a single replacement transaction that:
 

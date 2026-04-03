@@ -142,7 +142,7 @@ impl TestEnv {
             .map(|name| {
                 let addr = self.new_address(name, &AddressType::Bech32);
                 let pubkey_hex = self
-                    .wallet_client(&name)
+                    .wallet_client(name)
                     .get_address_info(&addr)
                     .unwrap()
                     .pubkey
@@ -177,7 +177,7 @@ impl TestEnv {
                 &[
                     json!(psbt.to_string()),
                     json!(true),
-                    json!("ALL|ANYONECANPAY"),
+                    json!("NONE|ANYONECANPAY"),
                 ],
             )
             .unwrap();
