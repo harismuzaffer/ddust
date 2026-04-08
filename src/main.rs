@@ -2,7 +2,7 @@ use bdk_redb::Store;
 use bdk_wallet::bitcoin::secp256k1::{All, Secp256k1};
 use bdk_wallet::bitcoin::{
     Address, Amount, EcdsaSighashType, Network, OutPoint, Psbt, ScriptBuf, TapSighashType,
-    Transaction, TxIn,
+    Transaction, TxIn, TxOut,
 };
 use bdk_wallet::descriptor::ExtendedDescriptor;
 
@@ -17,6 +17,7 @@ use bdk_wallet::bitcoin::psbt::PsbtParseError;
 use bdk_wallet::bitcoin::script::Instruction;
 use bdk_wallet::bitcoin::script::PushBytesBuf;
 use bdk_wallet::chain::{CanonicalizationParams, CheckPoint};
+use bdk_wallet::coin_selection::DefaultCoinSelectionAlgorithm;
 use bdk_wallet::serde::Serialize;
 use bdk_wallet::{LocalOutput, PersistedWallet, Wallet, miniscript, wallet_name_from_descriptor};
 use clap::{Parser, Subcommand, ValueEnum};
@@ -71,6 +72,14 @@ fn main() {
                 .expect("invalid network");
             if let Some(psbt) = cmd_spend(&db, network, &rpc_client, dust_amount, filter_address) {
                 println!("{}", psbt);
+            }
+        }
+        Commands::Batch => {
+            if let Some(tx) = cmd_batch(&rpc_client) {
+                let txid = rpc_client
+                    .send_raw_transaction(&tx)
+                    .expect("failed to broadcast batch transaction");
+                println!("{}", txid);
             }
         }
         Commands::Broadcast { psbt } => {
@@ -221,6 +230,46 @@ fn cmd_spend(
     None
 }
 
+fn cmd_batch(rpc_client: &Client) -> Option<Transaction> {
+    let unconfirmed_txs = find_unconfirmed_ddust_txs(rpc_client);
+    debug!("found {} unconfirmed ddust txs", unconfirmed_txs.len());
+
+    let batchable_txs = find_batchable_txs(rpc_client, &[], &unconfirmed_txs);
+
+    if batchable_txs.len() >= 2 {
+        debug!("batching {} unconfirmed txs", batchable_txs.len());
+        let mut inputs = vec![];
+        for tx in &batchable_txs {
+            for input in &tx.input {
+                inputs.push(input.clone());
+            }
+        }
+        // deterministic ordering so independent aggregators produce the same txid
+        inputs.sort_by(|a, b| a.previous_output.cmp(&b.previous_output));
+
+        // preserve the OP_RETURN output from the first batchable tx
+        let op_return_output = TxOut {
+            value: Amount::ZERO,
+            script_pubkey: batchable_txs[0].output[0].script_pubkey.clone(),
+        };
+
+        let tx = Transaction {
+            version: batchable_txs[0].version,
+            lock_time: LockTime::from_height(0).expect("valid height"),
+            input: inputs,
+            output: vec![op_return_output],
+        };
+
+        Some(tx)
+    } else {
+        info!(
+            "not enough batchable txs found (need at least 2, found {})",
+            batchable_txs.len()
+        );
+        None
+    }
+}
+
 fn cmd_broadcast(rpc_client: &Client, psbt: Psbt) -> bdk_wallet::bitcoin::Txid {
     let tx = psbt
         .extract_tx()
@@ -271,6 +320,8 @@ enum Commands {
         /// Bitcoin address of dust to be spent
         address: String,
     },
+    /// Batch unconfirmed ddust transactions without contributing any inputs, returns txid
+    Batch,
     /// Broadcast a PSBT after it's been signed, returns txid
     Broadcast {
         #[arg(value_parser = parse_psbt)]
@@ -1200,5 +1251,93 @@ mod tests {
             .env
             .wallet_process_psbt(&ctx.wallet2_name, &psbt_batched);
         broadcast_and_assert(&ctx, signed, 1, OpReturn::Ash);
+    }
+
+    /// Test that cmd_batch (third-party batching without contributing inputs)
+    /// fails RBF rule #4 regardless of dust amounts.
+    /// Rule #4 requires the replacement to pay additional fees to cover its relay
+    /// bandwidth, but since the batch tx has the same total fee as the sum of the
+    /// replaced txs, the additional fee is always 0.
+    #[test]
+    fn test_batch_without_own_inputs() {
+        let ctx = TestContext::new();
+
+        let desc = ctx
+            .env
+            .get_descriptor(&ctx.wallet1_name, &AddressType::Bech32m);
+        cmd_add(&ctx.secp, &ctx.db, ctx.network, &ctx.rpc_client, desc, 0);
+        let desc = ctx
+            .env
+            .get_descriptor(&ctx.wallet1_name, &AddressType::Legacy);
+        cmd_add(&ctx.secp, &ctx.db, ctx.network, &ctx.rpc_client, desc, 0);
+        let desc = ctx
+            .env
+            .get_descriptor(&ctx.wallet2_name, &AddressType::Bech32m);
+        cmd_add(&ctx.secp, &ctx.db, ctx.network, &ctx.rpc_client, desc, 0);
+        let desc = ctx
+            .env
+            .get_descriptor(&ctx.wallet2_name, &AddressType::Legacy);
+        cmd_add(&ctx.secp, &ctx.db, ctx.network, &ctx.rpc_client, desc, 0);
+
+        // Test with small dust (300 sats)
+        let dust_sats = Amount::from_sat(600);
+        let addr1 = ctx
+            .env
+            .new_address(&ctx.wallet1_name, &AddressType::Bech32m);
+        ctx.env.send_to_address(&addr1, Amount::from_sat(300));
+        let addr2 = ctx
+            .env
+            .new_address(&ctx.wallet2_name, &AddressType::Bech32m);
+        ctx.env.send_to_address(&addr2, Amount::from_sat(300));
+        ctx.env.mine_blocks(1);
+
+        // spend each address separately to create two unconfirmed ddust txs
+        let psbt1 = cmd_spend(&ctx.db, ctx.network, &ctx.rpc_client, dust_sats, addr1).unwrap();
+        let signed1 = ctx.env.wallet_process_psbt(&ctx.wallet1_name, &psbt1);
+        cmd_broadcast(&ctx.rpc_client, signed1);
+
+        let psbt2 = cmd_spend(&ctx.db, ctx.network, &ctx.rpc_client, dust_sats, addr2).unwrap();
+        let signed2 = ctx.env.wallet_process_psbt(&ctx.wallet2_name, &psbt2);
+        cmd_broadcast(&ctx.rpc_client, signed2);
+
+        // verify two ddust txs are in the mempool
+        let unconfirmed = find_unconfirmed_ddust_txs(&ctx.rpc_client);
+        assert_eq!(unconfirmed.len(), 2, "expected 2 unconfirmed ddust txs");
+
+        // cmd_batch should produce a tx but broadcasting should fail (RBF rule #4)
+        let batch_tx = cmd_batch(&ctx.rpc_client);
+        assert!(batch_tx.is_some(), "expected a batch tx to be created");
+        let result = ctx.rpc_client.send_raw_transaction(&batch_tx.unwrap());
+        assert!(result.is_err(), "small dust: batch broadcast should fail due to RBF rule #4");
+
+        // mine and try again with large dust (50,000 sats)
+        ctx.env.mine_blocks(1);
+
+        let addr3 = ctx
+            .env
+            .new_address(&ctx.wallet1_name, &AddressType::Legacy);
+        ctx.env.send_to_address(&addr3, Amount::from_sat(50_000));
+        let addr4 = ctx
+            .env
+            .new_address(&ctx.wallet2_name, &AddressType::Legacy);
+        ctx.env.send_to_address(&addr4, Amount::from_sat(50_000));
+        ctx.env.mine_blocks(1);
+
+        let large_dust_sats = Amount::from_sat(100_000);
+        let psbt3 = cmd_spend(&ctx.db, ctx.network, &ctx.rpc_client, large_dust_sats, addr3).unwrap();
+        let signed3 = ctx.env.wallet_process_psbt(&ctx.wallet1_name, &psbt3);
+        cmd_broadcast(&ctx.rpc_client, signed3);
+
+        let psbt4 = cmd_spend(&ctx.db, ctx.network, &ctx.rpc_client, large_dust_sats, addr4).unwrap();
+        let signed4 = ctx.env.wallet_process_psbt(&ctx.wallet2_name, &psbt4);
+        cmd_broadcast(&ctx.rpc_client, signed4);
+
+        let unconfirmed = find_unconfirmed_ddust_txs(&ctx.rpc_client);
+        assert_eq!(unconfirmed.len(), 2, "expected 2 unconfirmed ddust txs");
+
+        let batch_tx = cmd_batch(&ctx.rpc_client);
+        assert!(batch_tx.is_some(), "expected a batch tx to be created");
+        let result = ctx.rpc_client.send_raw_transaction(&batch_tx.unwrap());
+        assert!(result.is_err(), "large dust: batch broadcast should fail due to RBF rule #4");
     }
 }
