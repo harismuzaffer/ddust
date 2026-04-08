@@ -171,64 +171,19 @@ fn cmd_spend(
                     .add_utxos(&utxos)
                     .expect("failed to add dust outpoints");
 
-                if !unconfirmed_txs.is_empty()
-                    && should_batch(
-                        rpc_client,
-                        input_amount,
-                        &unconfirmed_txs,
-                        &dust,
-                        &unconfirmed_txs[0].output[0].script_pubkey,
-                    )
-                {
-                    debug!("unconfirmed txs can be batched");
-                    for tx in &unconfirmed_txs {
-                        for input in &tx.input {
-                            let f_outpoint = input.previous_output;
-                            let f_input_prev_tx = rpc_client
-                                .get_raw_transaction(&f_outpoint.txid, None)
-                                .unwrap();
-                            let f_prev_txout =
-                                f_input_prev_tx.output[f_outpoint.vout as usize].clone();
+                let batchable_txs = find_batchable_txs(rpc_client, &dust, &unconfirmed_txs);
 
-                            input_amount += f_prev_txout.value;
-
-                            let mut f_psbt_input = Input::default();
-                            // p2tr sighash algorithm commits to all input amounts, thus
-                            // non_witness_utxo is not needed to verify the input value
-                            if f_prev_txout.script_pubkey.is_p2tr() {
-                                f_psbt_input.witness_utxo = Some(f_prev_txout);
-                            } else {
-                                f_psbt_input.non_witness_utxo = Some(f_input_prev_tx.clone());
-                            }
-                            if !input.witness.is_empty() {
-                                f_psbt_input.final_script_witness = Some(input.witness.clone());
-                            }
-                            if !input.script_sig.is_empty() {
-                                f_psbt_input.final_script_sig = Some(input.script_sig.clone());
-                            }
-                            tx_builder
-                                .add_foreign_utxo_with_sequence(
-                                    f_outpoint,
-                                    f_psbt_input,
-                                    input.segwit_weight(),
-                                    input.sequence,
-                                )
-                                .unwrap_or_else(|_| {
-                                    panic!(
-                                        "failed to add the foreign UTXO. Outpoint: {}",
-                                        f_outpoint
-                                    )
-                                });
-                        }
-                    }
+                if !batchable_txs.is_empty() {
+                    debug!("batching {} unconfirmed txs", batchable_txs.len());
+                    input_amount += add_foreign_utxos(rpc_client, &mut tx_builder, &batchable_txs);
                 }
 
                 info!("total spent to fees: {}", &input_amount);
                 tx_builder.fee_absolute(input_amount);
 
-                if !unconfirmed_txs.is_empty() {
-                    // the new tx shall use the data found in the unconfirmed txs
-                    let suggested_script = &unconfirmed_txs[0].output[0].script_pubkey;
+                if !batchable_txs.is_empty() {
+                    // the new tx shall use the data found in the batchable txs
+                    let suggested_script = &batchable_txs[0].output[0].script_pubkey;
                     let op_return = match suggested_script.as_bytes() {
                         // empty OP_RETURN no data
                         [0x6a, 0x00] => vec![],
@@ -564,6 +519,53 @@ fn find_unconfirmed_ddust_txs(rpc_client: &Client) -> Vec<Transaction> {
     unconfirmed_txs
 }
 
+/// Adds pre-signed inputs from unconfirmed ddust transactions as foreign UTXOs
+/// to the given tx_builder. Returns the total amount added.
+fn add_foreign_utxos(
+    rpc_client: &Client,
+    tx_builder: &mut bdk_wallet::TxBuilder<'_, DefaultCoinSelectionAlgorithm>,
+    unconfirmed_txs: &[Transaction],
+) -> Amount {
+    let mut added_amount = Amount::ZERO;
+    for tx in unconfirmed_txs {
+        for input in &tx.input {
+            let f_outpoint = input.previous_output;
+            let f_input_prev_tx = rpc_client
+                .get_raw_transaction(&f_outpoint.txid, None)
+                .unwrap();
+            let f_prev_txout = f_input_prev_tx.output[f_outpoint.vout as usize].clone();
+
+            added_amount += f_prev_txout.value;
+
+            let mut f_psbt_input = Input::default();
+            // p2tr sighash algorithm commits to all input amounts, thus
+            // non_witness_utxo is not needed to verify the input value
+            if f_prev_txout.script_pubkey.is_p2tr() {
+                f_psbt_input.witness_utxo = Some(f_prev_txout);
+            } else {
+                f_psbt_input.non_witness_utxo = Some(f_input_prev_tx.clone());
+            }
+            if !input.witness.is_empty() {
+                f_psbt_input.final_script_witness = Some(input.witness.clone());
+            }
+            if !input.script_sig.is_empty() {
+                f_psbt_input.final_script_sig = Some(input.script_sig.clone());
+            }
+            tx_builder
+                .add_foreign_utxo_with_sequence(
+                    f_outpoint,
+                    f_psbt_input,
+                    input.segwit_weight(),
+                    input.sequence,
+                )
+                .unwrap_or_else(|_| {
+                    panic!("failed to add the foreign UTXO. Outpoint: {}", f_outpoint)
+                });
+        }
+    }
+    added_amount
+}
+
 /// ddust pattern:
 /// has a single op_return
 /// one or more inputs with SIGHASH_ALL|ANYONECANPAY signature type
@@ -660,64 +662,109 @@ fn is_dust(out: &LocalOutput, dust_amount: &Amount) -> bool {
     !out.is_spent && out.txout.value <= *dust_amount && out.chain_position.is_confirmed()
 }
 
-/// Checks if batching dust inputs with existing ddust transactions in the mempool
-/// produces a fee rate at least 1 sat/vB higher than the highest existing fee rate,
-/// as required by RBF replacement rules.
-fn should_batch(
+/// Finds the subset of unconfirmed ddust transactions that can be batched together. Sorts by fee
+/// rate ascending and accumulates transactions, stopping when adding the next one would drop the
+/// combined fee rate below the RBF threshold. `dust_utxos` represent the inputs that the batcher
+/// wants to add(zero for pure batch).
+///
+/// Sorting by fee rate ascending allows adding cheap ones first to increase likelyhood of batching
+fn find_batchable_txs(
     rpc_client: &Client,
-    this_amount: Amount,
-    unconfirmed_txs: &Vec<Transaction>,
     dust_utxos: &[LocalOutput],
-    output_script: &ScriptBuf,
-) -> bool {
-    // this tx fee rate > max foreign tx fee rate
-    // this tx fee rate = fee / vsize
-    // -> total dust amt / vsize
-    // vsize = overhead + one op_return output + (new dust utxos + foreign utxos)
-    let mut max_fee_rate: f64 = 0.0;
-    let mut tx_vsize: f64 = 0.0;
-    let mut input_amount: Amount = this_amount;
-
-    // overhead size
-    tx_vsize += 10.5;
-    // size of dust inputs to be spent
-    tx_vsize += dust_utxos
+    unconfirmed_txs: &[Transaction],
+) -> Vec<Transaction> {
+    if unconfirmed_txs.is_empty() {
+        return vec![];
+    }
+    // collect fee rate info for each unconfirmed tx
+    let mut tx_info: Vec<(Transaction, Amount, f64, f64)> = unconfirmed_txs
         .iter()
-        .map(|utxo| estimate_input_vsize(&utxo.txout.script_pubkey))
-        .sum::<f64>();
+        .map(|tx| {
+            let entry = rpc_client.get_mempool_entry(&tx.compute_txid()).unwrap();
+            let fee = entry.fees.base;
+            let vsize = entry.vsize as f64;
+            let rate = fee.to_sat() as f64 / vsize;
+            let input_vsize: f64 = tx.input.iter().map(|i| get_input_vsize(i)).sum();
+            info!("vsize: {} and input size: {}", vsize, input_vsize);
+            (tx.clone(), fee, rate, input_vsize)
+        })
+        .collect();
 
-    tx_vsize += match output_script.as_bytes() {
+    // sort by fee rate ascending to add cheap ones first
+    tx_info.sort_by(|a, b| a.2.partial_cmp(&b.2).unwrap());
+
+    let mut batchable: Vec<Transaction> = vec![];
+    // overhead
+    let mut base_vsize = 10.5;
+
+    let base_amount: Amount = if dust_utxos.is_empty() {
+        let first_tx_info = tx_info.remove(0);
+        base_vsize += first_tx_info.3;
+        batchable.push(first_tx_info.0);
+        first_tx_info.1
+    } else {
+        base_vsize += dust_utxos
+            .iter()
+            .map(|utxo| estimate_input_vsize(&utxo.txout.script_pubkey))
+            .sum::<f64>();
+        dust_utxos.iter().map(|out| out.txout.value).sum()
+    };
+
+    // one output size
+    base_vsize += match &unconfirmed_txs[0].output[0].script_pubkey.as_bytes() {
         // empty OP_RETURN no data, size = 11
         [0x6a, 0x00] => 11.0,
         // contains 3 bytes 'ash', size = 14
         _ => 14.0,
     };
 
-    for tx in unconfirmed_txs {
-        let entry = rpc_client.get_mempool_entry(&tx.compute_txid()).unwrap();
-        let fee = entry.fees.base;
-        input_amount += fee;
-        let fee_sats = fee.to_sat();
-        let vsize = entry.vsize;
-        let rate = fee_sats as f64 / vsize as f64;
-        if rate > max_fee_rate {
-            max_fee_rate = rate;
-        }
+    let mut combined_vsize: f64 = base_vsize;
+    let mut combined_amount: Amount = base_amount;
+    let mut max_fee_rate: f64 = 0.0;
 
-        for input in &tx.input {
-            // foreign utxo input size
-            tx_vsize += get_input_vsize(input);
+    for (tx, fee, rate, input_vsize) in tx_info {
+        let new_amount = combined_amount + fee;
+        let new_vsize = combined_vsize + input_vsize;
+        let new_fee_rate = new_amount.to_sat() as f64 / new_vsize;
+
+        if batchable.is_empty() {
+            // first tx is the baseline, no RBF check needed
+            combined_amount = new_amount;
+            combined_vsize = new_vsize;
+            max_fee_rate = rate;
+            batchable.push(tx);
+            debug!(
+                "baseline tx, fee_rate: {:.2}",
+                new_fee_rate
+            );
+        } else {
+            let new_max_rate = if rate > max_fee_rate {
+                rate
+            } else {
+                max_fee_rate
+            };
+
+            if new_fee_rate > new_max_rate + 0.1 {
+                combined_amount = new_amount;
+                combined_vsize = new_vsize;
+                max_fee_rate = new_max_rate;
+                batchable.push(tx);
+                debug!(
+                    "batching tx, combined_fee_rate: {:.2}, max_replaced_rate: {:.2}",
+                    new_fee_rate, max_fee_rate
+                );
+            } else {
+                debug!(
+                    "skipping tx with rate {:.2}, would drop combined rate to {:.2} (need > {:.2})",
+                    rate,
+                    new_fee_rate,
+                    new_max_rate + 0.1
+                );
+            }
         }
     }
 
-    let tx_fee_rate = input_amount.to_sat() as f64 / tx_vsize;
-    debug!(
-        "tx_fee_rate: {}, max_fee_rate: {}, batch? {}",
-        tx_fee_rate,
-        max_fee_rate,
-        tx_fee_rate > max_fee_rate + 0.1
-    );
-    tx_fee_rate > max_fee_rate + 0.1
+    batchable
 }
 
 #[cfg(test)]
