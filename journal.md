@@ -148,12 +148,35 @@ As part of the Test Env setup, i also updated the docs for "Mempool batching"
 
 ### Next Steps
 - Address BIP review feedback and iterate on [PR #20](https://github.com/bubb1es71/ddust/pull/20)
+ 
+## [08.04.2026] - Transition to `NONE|ANYONECANPAY`, third-party batching (now obsolete)
+
+### In Review and In Progress
+- [PR #28](https://github.com/bubb1es71/ddust/pull/28) - Bubb1es working on [Issue #27](https://github.com/bubb1es71/ddust/issues/27) - using sighash `NONE|ANYONECANPAY` for ddust txs
+- Starting working on
+  - [Issue #26](https://github.com/bubb1es71/ddust/issues/26) - Broadcast transactions using `privatebroadcast`
+  - [Issue #23](https://github.com/bubb1es71/ddust/issues/23) - Add more batching integration tests
+
+### Collaboration
+- [x] I worked on [Issue #24](https://github.com/bubb1es71/ddust/issues/24) - Add feature to batch unconfirmed ddust txs without adding any new inputs. Unfortunately this could not go into the code base because we found that BIP 125 rule #4 cannot be satisfied. More details under Journal section. Code [here](https://github.com/harismuzaffer/ddust/tree/feat/batch-without-input)
+- [x] [PR #28](https://github.com/bubb1es71/ddust/pull/28) is currently in review but still in draft state. I am reviewing the PR and got involved in the discussion of transitioning ddust txs sighash from `SIGHASH_ALL|ANYONECANPAY` to `NONE|ANYONECANPAY`
+- [x] Also check the thread starting from [Delving Bitcoin](https://delvingbitcoin.org/t/disposing-of-dust-attack-utxos/2215/20) and onwards
+
+### Journal
+Based on the discussion on [Delving Bitcoin](https://delvingbitcoin.org/t/disposing-of-dust-attack-utxos/2215/20), it was proposed to use sighash `NONE|ANYONECANPAY` instead of `SIGHASH_ALL|ANYONECANPAY` to let batched txs change the OP_RETURN data and drop the "ash" OP_RETURN padding, saving a few more bytes of block space. This transition doesn't add any spam vector. An attacker can't steal the sats and send them to their own address because RBF prevents it - the new tx would have a lower fee rate and lower absolute fee since the original tx paid the entire amount as fee. The attacker would have to add as many sats to the tx as they want to send to their address, hence the net profit would always be zero.
+
+Another thing I was excited about was adding the feature that allows external aggregators to batch ddust txs without contributing any inputs. However, at the time of testing, I found that the replacement tx was rejected due to an "insufficient fee" error. I went back to read BIP 125 and it states that one of the RBF rules requires the replacement tx to pay for its own bandwidth at or above the rate set by the node's minimum relay fee setting - i.e., the replacement tx must pay both a higher fee rate (BTC/vbyte) and a higher absolute fee (total BTC). This is not possible without adding new inputs to the ddust tx because to satisfy "higher absolute fee" you need extra sats to cover that. Since ddust txs have no change output and the only output is an `OP_RETURN`, the only way to satisfy this rule is to add new inputs. Thus we had to abandon this feature.
+
+I am also looking into the new feature of allowing broadcasting ddust txs using `privatebroadcast`. Note that `privatebroadcast` is available from [core 31.0](https://github.com/bitcoin-core/bitcoin-devwiki/wiki/31.0-Release-Notes-Draft#p2p-and-network-changes) and onwards, check [bitcoin/bitcoin#29415](https://github.com/bitcoin/bitcoin/pull/29415). `privatebroadcast` uses a new short-lived Tor or I2P connections to broadcast each transaction without linking it to the IP address of the sending node
+
+### Next Steps
+- Colloborate with Bubb1es on the new github [issues](https://github.com/bubb1es71/ddust/issues/)
 
 ---
 
 ### Ideas Backlog
-| Feature                        | Description                                                                  | Comments                                                            |
-|--------------------------------|------------------------------------------------------------------------------|---------------------------------------------------------------------|
-| Staggered broadcast scheduling | Spread dust spends over time with random delays to reduce timing correlation |                                                                     |
-| Dry run mode                   | Preview what would happen without broadcasting                               |                                                                     |
-| Private broadcast              | Integrate `-privatebroadcast` flag (Bitcoin Core v31+)                       | bubb1es prefers that private broadcast should be left upto the user |
+| Feature                        | Description                                                                  | Comments                                             |
+|--------------------------------|------------------------------------------------------------------------------|------------------------------------------------------|
+| Staggered broadcast scheduling | Spread dust spends over time with random delays to reduce timing correlation |                                                      |
+| Dry run mode                   | Preview what would happen without broadcasting                               |                                                      |
+| Private broadcast              | Integrate `-privatebroadcast` flag (Bitcoin Core v31+)                       | [PR #20](https://github.com/bubb1es71/ddust/pull/20) |
