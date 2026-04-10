@@ -56,9 +56,8 @@ A compliant dust disposal transaction MUST satisfy all the following requirement
 
 #### Overall
 
-1. The transaction MUST signal RBF replaceability (nSequence < 0xFFFFFFFE).
-2. The ntimelock MUST be set to block height 0.
-3. The fee rate MUST be at least 0.1 sat/vB.
+1. The nLockTime MUST be set to block height 0.
+2. The fee rate MUST be at least 0.1 sat/vB.
 
 #### Outputs
 
@@ -70,9 +69,10 @@ A compliant dust disposal transaction MUST satisfy all the following requirement
 
 #### Inputs
 
-1. All inputs MUST use the signature hash type `NONE|ANYONECANPAY` (0x81).
-2. For Taproot (P2TR) inputs using key-path spending, implementations MUST explicitly append the signature hash type byte `NONE|ANYONECANPAY` (0x81) to enable ANYONECANPAY semantics, as the default sighash for Taproot (SIGHASH_DEFAULT, which omits the byte) does not include ANYONECANPAY.
-3. All inputs must be confirmed in the blockchain at least one block deep.
+1. All inputs MUST set the nSequence to 0xFFFFFFFF (do not signal for BIP 125 RBF).
+2. All inputs MUST use the signature hash type `NONE|ANYONECANPAY` (0x81).
+3. For Taproot (P2TR) inputs using key-path spending, implementations MUST explicitly append the signature hash type byte `NONE|ANYONECANPAY` (0x81) to enable ANYONECANPAY semantics, as the default sighash for Taproot (SIGHASH_DEFAULT, which omits the byte) does not include ANYONECANPAY.
+4. All inputs must be confirmed in the blockchain at least one block deep.
 
 #### Transaction Size
 
@@ -171,6 +171,12 @@ Together these flags enable:
 
 - **User privacy**: Using the same nLockTime for all dust disposal transactions obscures when it was created.
 - **Fee sniping**: The value of disposal transactions should be small enough that fee sniping is not a concern.
+- **Fingerprinting**: Using the same nLockTime value for all dust disposal transactions prevents different implementations from being identified by this value.
+
+### Why nSequence 0xFFFFFFFF
+
+- **Fingerprinting**: Using the same nSequence value for all dust disposal inputs prevents different implementations from being identified by this value.
+- **Best practice**: BIP 125 Opt-in Full Replace-by-Fee Signaling is no longer used (as of Bitcoin Core 28.0+). This is a common nSequence value when not encoding a relative timelock.
 
 ## Backwards Compatibility
 
