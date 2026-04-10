@@ -1,8 +1,8 @@
 use bdk_redb::Store;
 use bdk_wallet::bitcoin::secp256k1::{All, Secp256k1};
 use bdk_wallet::bitcoin::{
-    Address, Amount, EcdsaSighashType, Network, OutPoint, Psbt, ScriptBuf, TapSighashType,
-    Transaction, TxIn,
+    Address, Amount, EcdsaSighashType, Network, OutPoint, Psbt, ScriptBuf, Sequence,
+    TapSighashType, Transaction, TxIn,
 };
 use bdk_wallet::descriptor::ExtendedDescriptor;
 
@@ -168,6 +168,7 @@ fn cmd_spend(
                 let mut tx_builder = wallet.build_tx();
                 tx_builder
                     .nlocktime(LockTime::from_height(0).expect("valid height"))
+                    .set_exact_sequence(Sequence::MAX)
                     .manually_selected_only()
                     .add_utxos(&utxos)
                     .expect("failed to add dust outpoints");
