@@ -121,7 +121,7 @@ Batch dust disposal transactions must follow all other transaction construction 
 
 This mempool-based approach preserves user privacy while enabling efficient batching:
 
-1. If no unconfirmed dust disposal transactions exist in the mempool broadcast a new dust disposal transaction to the network.
+1. If no unconfirmed dust disposal transactions exist in the mempool, broadcast a new dust disposal transaction to the network.
 2. When one or more unrelated, unconfirmed dust disposal transactions are found, try to create a compliant batch transaction with them.
 3. If no valid batch transaction can be created, fall-back to option 1.
 
@@ -135,12 +135,12 @@ This mempool-based approach preserves user privacy while enabling efficient batc
 #### Privacy Preservation
 
 - **Network surveillance**: Internet service providers and other internet monitors may be able to determine the nodes that initially broadcast a dust disposal transaction. If available the `sendrawtransaction -privatebroadcast` RPC feature should be used (Bitcoin Core 31.0).
-- **Timing Analysis**: Users should be aware that the timing of dust disposal transactions is publicly observable. Dust disposal transactions should **NOT** be broadcast at the same time or on a predictable schedule.
+- **Timing Analysis**: Users should be aware that the timing of dust disposal transactions is publicly observable. Dust disposal transactions for different addresses should **NOT** be broadcast at the same time or on a predictable schedule.
 - **Amount Analysis**: The specific dust amounts selected for dust disposal if outside the norm may be used to fingerprint the wallet creating the disposal transactions.
 
 #### Public Key Exposure
 
-- **Long term quantum attack**: Spending dust UTXOs for address types with a hashed public key reveal that public key. This would make non-dust funds locked by the same addresses vulnerable in a hypothetical future where cryptographically relevant quantum computers (CRQC) capable of long-exposure attacks against 256-bit ECDLP public keys exist.
+- **Long term quantum attack**: Spending dust UTXOs for address types with a hashed public key reveals that public key. This would make non-dust funds locked by the same addresses vulnerable in a hypothetical future where cryptographically relevant quantum computers (CRQC) capable of long-exposure attacks against 256-bit ECDLP public keys exist.
 - **Targeted dust**: An attacker may send dust UTXOs to a victim's wallet specifically to trick them into disposing of it and revealing the address's public key. This targeting could happen in anticipation of any future cryptographic attack that requires an exposed public key.
 
 ## Rationale
@@ -186,7 +186,7 @@ Together these flags enable:
 ### Why nSequence 0xFFFFFFFF
 
 - **Fingerprinting**: Using the same nSequence value for all dust disposal inputs prevents different implementations from being identified by this value.
-- **Best practice**: BIP 125 Opt-in Full Replace-by-Fee Signaling is no longer used (as of Bitcoin Core 28.0+). This is a common nSequence value when not encoding a relative timelock.
+- **Best practice**: BIP 125 Opt-in Full Replace-by-Fee Signaling is not required (as of Bitcoin Core 28.0+). This is a common nSequence value when not encoding a relative timelock.
 
 ## Backwards Compatibility
 
