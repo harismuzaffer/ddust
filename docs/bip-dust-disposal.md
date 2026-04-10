@@ -85,6 +85,21 @@ A compliant dust disposal transaction MUST satisfy all the following requirement
 2. The transaction fee rate MUST meet the bitcoin network minimum relay requirements (0.1 sat/vB for Bitcoin Core 28.3, 29.1, 30.0+).
 3. The transaction fee rate MAY be higher based on the available dust UTXO amounts and transaction size.
 
+### Dust Selection
+
+Implementations SHOULD allow users to configure how dust UTXOs are selected based on:
+
+1. The current and anticipated fee rates.
+2. The UTXO script type, different types have different spending costs.
+3. The varying amounts that may be used by dust attack initiators.
+
+A UTXO is generally considered dust if its value is less than the cost to spend it at a reasonable fee rate, but any small UTXO value could be used in a dust attack.
+
+Implementations SHOULD NOT select dust UTXOs for disposal if there are any unspent, non-dust UTXOs for the same address. This is especially important if:
+
+1. No funds have previously been spent from the address.
+2. The address type uses a hashed public key (e.g. P2PKH, P2WPKH).
+
 ### Address Consolidation Rules
 
 Implementations consolidating dust UTXOs owned by a single user (i.e., not batching unrelated dust UTXOs):
@@ -110,16 +125,6 @@ This mempool-based approach preserves user privacy while enabling efficient batc
 2. When one or more unrelated, unconfirmed dust disposal transactions are found, try to create a compliant batch transaction with them.
 3. If no valid batch transaction can be created, fall-back to option 1.
 
-### Dust Threshold
-
-Implementations SHOULD allow users to configure their own dust threshold based on:
-
-1. The current and anticipated fee rates.
-2. The dust input script type, different types have different spending costs.
-3. The varying amounts that may be used by dust attack initiators.
-
-A UTXO is generally considered dust if its value is less than the cost to spend it at a reasonable fee rate, but any small UTXO value could be used in a dust attack.
-
 ### Security Considerations
 
 #### Transaction Signing
@@ -132,6 +137,11 @@ A UTXO is generally considered dust if its value is less than the cost to spend 
 - **Network surveillance**: Internet service providers and other internet monitors may be able to determine the nodes that initially broadcast a dust disposal transaction. If available the `sendrawtransaction -privatebroadcast` RPC feature should be used (Bitcoin Core 31.0).
 - **Timing Analysis**: Users should be aware that the timing of dust disposal transactions is publicly observable. Dust disposal transactions should **NOT** be broadcast at the same time or on a predictable schedule.
 - **Amount Analysis**: The specific dust amounts selected for dust disposal if outside the norm may be used to fingerprint the wallet creating the disposal transactions.
+
+#### Public Key Exposure
+
+- **Long term quantum attack**: Spending dust UTXOs for address types with a hashed public key reveal that public key. This would make non-dust funds locked by the same addresses vulnerable in a hypothetical future where cryptographically relevant quantum computers (CRQC) capable of long-exposure attacks against 256-bit ECDLP public keys exist.
+- **Targeted dust**: An attacker may send dust UTXOs to a victim's wallet specifically to trick them into disposing of it and revealing the address's public key. This targeting could happen in anticipation of any future cryptographic attack that requires an exposed public key.
 
 ## Rationale
 
