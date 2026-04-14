@@ -668,12 +668,18 @@ fn is_dust(out: &LocalOutput, dust_amount: &Amount) -> bool {
     !out.is_spent && out.txout.value <= *dust_amount && out.chain_position.is_confirmed()
 }
 
-/// Finds the subset of unconfirmed ddust transactions that can be batched together. Sorts by fee
-/// rate ascending and accumulates transactions, stopping when adding the next one would drop the
-/// combined fee rate below the RBF threshold. `dust_utxos` represent the inputs that the batcher
-/// wants to add
+/// Selects unconfirmed ddust transactions that can be batched into a single RBF-compliant replacement.
+/// `dust_utxos` are extra inputs added by the batcher.
 ///
-/// Sorting by fee rate ascending allows adding cheap ones first to increase likelyhood of batching
+/// Replacement fee:
+/// new_fee = sum(dust_utxos) + sum(replaced_fees)
+///
+/// A transaction is included only if:
+///
+/// * Total fee pays at least the absolute fee of all replaced txs. This is gauranteed since each tx contributes > 0 sats
+/// * Replacement tx pays for its own bandwidth i.e. Added fee > 0.1 × replacement_vsize
+/// * Replacement feerate exceeds all included txs (processed in ascending order)
+/// * Total replaced txs stay within the mempool eviction limit (100)
 fn find_batchable_txs(
     rpc_client: &Client,
     dust_utxos: &[LocalOutput],
@@ -685,7 +691,6 @@ fn find_batchable_txs(
     let output_script = &unconfirmed_txs[0].output[0].script_pubkey;
 
     let mut batchable: Vec<Transaction> = vec![];
-    let tx_input_amount: Amount = dust_utxos.iter().map(|out| out.txout.value).sum();
 
     // replacement tx vsize
     // overhead
@@ -702,7 +707,10 @@ fn find_batchable_txs(
         _ => 14.0,
     };
 
-    // collect fee rate info for each unconfirmed tx
+    let tx_input_amount: Amount = dust_utxos.iter().map(|out| out.txout.value).sum();
+    let dust_amount_sats = tx_input_amount.to_sat() as f64;
+
+    // collect fee, rate and input vsize for each unconfirmed tx
     let mut tx_info: Vec<(Transaction, Amount, f64, f64)> = unconfirmed_txs
         .iter()
         .map(|tx| {
@@ -710,37 +718,49 @@ fn find_batchable_txs(
             let fee = entry.fees.base;
             let vsize = entry.vsize as f64;
             let rate = fee.to_sat() as f64 / vsize;
-            let input_vsize: f64 = tx.input.iter().map(|i| get_input_vsize(i)).sum();
-            info!("vsize: {} and input size: {}", vsize, input_vsize);
+            let input_vsize: f64 = tx.input.iter().map(get_input_vsize).sum();
             (tx.clone(), fee, rate, input_vsize)
         })
         .collect();
 
-    // sort by fee rate ascending to add cheap ones first. because of this ordering, the current
-    // iteration's `rate` is always the max rate among txs accepted so far, so comparing
-    // `new_fee_rate > rate + 0.1` is equivalent to "new rate > max replaced rate + 0.1".
+    // sort ascending by fee rate so the rate check against the current iteration's rate
+    // covers all previously accepted txs (their rates are <= current).
     tx_info.sort_by(|a, b| a.2.partial_cmp(&b.2).unwrap());
+
+    // mempool eviction cap
+    const MAX_REPLACED: usize = 100;
 
     let mut combined_vsize: f64 = tx_vsize;
     let mut combined_amount: Amount = tx_input_amount;
 
     for (tx, fee, rate, input_vsize) in tx_info {
+        if batchable.len() >= MAX_REPLACED {
+            debug!("batchable: hit eviction cap of {} txs", MAX_REPLACED);
+            break;
+        }
         let new_amount = combined_amount + fee;
         let new_vsize = combined_vsize + input_vsize;
-        let new_fee_rate = new_amount.to_sat() as f64 / new_vsize;
-        if new_fee_rate > rate + 0.1 {
+        let new_rate = new_amount.to_sat() as f64 / new_vsize;
+
+        // additional fee (dust_amount_sats) must cover incremental relay over new vsize.
+        let bandwidth_ok = dust_amount_sats >= 0.1 * new_vsize;
+        // replacement rate must exceed every replaced tx's rate.
+        let rate_ok = new_rate > rate;
+
+        if bandwidth_ok && rate_ok {
             debug!(
-                "batchable: adding tx with rate {:.3} sat/vB, combined rate {:.3} sat/vB",
-                rate, new_fee_rate
+                "batchable: adding tx (rate {:.3}, combined rate {:.3}, combined vsize {:.1})",
+                rate, new_rate, new_vsize
             );
             combined_amount = new_amount;
             combined_vsize = new_vsize;
             batchable.push(tx);
         } else {
-            // sorted ascending, so any subsequent tx has rate >= this one and would also fail.
+            // sorted ascending by rate, so subsequent txs have rate >= this one (rate check
+            // gets harder) and add at least some vsize (bandwidth check gets harder).
             debug!(
-                "batchable: stopping at tx with rate {:.3} sat/vB (combined rate {:.3} would not exceed threshold)",
-                rate, new_fee_rate
+                "batchable: stopping at rate {:.3} (bandwidth_ok={}, rate_ok={}, combined rate {:.3}, combined vsize {:.1})",
+                rate, bandwidth_ok, rate_ok, new_rate, new_vsize
             );
             break;
         }
