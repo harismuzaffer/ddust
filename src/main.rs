@@ -160,7 +160,6 @@ fn cmd_spend(
             debug!("dust: {:?}", dust);
             if !dust.is_empty() {
                 let mut input_amount: Amount = dust.iter().map(|out| out.txout.value).sum();
-                let mut num_inputs = dust.len();
                 let utxos = dust.iter().map(|out| out.outpoint).collect::<Vec<_>>();
                 let unconfirmed_txs = find_unconfirmed_ddust_txs(rpc_client);
                 debug!("found {} unconfirmed ddust txs", unconfirmed_txs.len());
@@ -174,7 +173,13 @@ fn cmd_spend(
                     .expect("failed to add dust outpoints");
 
                 if !unconfirmed_txs.is_empty()
-                    && should_batch(rpc_client, input_amount, &unconfirmed_txs, &dust)
+                    && should_batch(
+                        rpc_client,
+                        input_amount,
+                        &unconfirmed_txs,
+                        &dust,
+                        &unconfirmed_txs[0].output[0].script_pubkey,
+                    )
                 {
                     debug!("unconfirmed txs can be batched");
                     for tx in &unconfirmed_txs {
@@ -186,7 +191,6 @@ fn cmd_spend(
                             let f_prev_txout =
                                 f_input_prev_tx.output[f_outpoint.vout as usize].clone();
 
-                            num_inputs += 1;
                             input_amount += f_prev_txout.value;
 
                             let mut f_psbt_input = Input::default();
@@ -223,14 +227,27 @@ fn cmd_spend(
                 info!("total spent to fees: {}", &input_amount);
                 tx_builder.fee_absolute(input_amount);
 
-                // add op_return with data if single witness input, so Tx is 65vb
-
-                if num_inputs == 1 && dust[0].txout.script_pubkey.is_witness_program() {
-                    let data = PushBytesBuf::try_from("ash".as_bytes().to_vec()).unwrap();
+                if !unconfirmed_txs.is_empty() {
+                    // the new tx shall use the data found in the unconfirmed txs
+                    let suggested_script = &unconfirmed_txs[0].output[0].script_pubkey;
+                    let op_return = match suggested_script.as_bytes() {
+                        // empty OP_RETURN no data
+                        [0x6a, 0x00] => vec![],
+                        // skip 0x6a (OP_RETURN) and push byte
+                        [0x6a, _, rest @ ..] => rest.to_vec(),
+                        _ => vec![],
+                    };
+                    let data = PushBytesBuf::try_from(op_return).unwrap();
                     tx_builder.add_data(&data);
                 } else {
-                    let data = PushBytesBuf::try_from(vec![]).unwrap();
-                    tx_builder.add_data(&data);
+                    // add op_return with data if single witness input, so Tx is 65vb
+                    if dust.len() == 1 && dust[0].txout.script_pubkey.is_witness_program() {
+                        let data = PushBytesBuf::try_from("ash".as_bytes().to_vec()).unwrap();
+                        tx_builder.add_data(&data);
+                    } else {
+                        let data = PushBytesBuf::try_from(vec![]).unwrap();
+                        tx_builder.add_data(&data);
+                    }
                 }
 
                 // set script type to ALL|ANYONECANPAY
@@ -598,10 +615,10 @@ fn is_ddust_tx(tx: &Transaction, want_script: &Option<Vec<u8>>) -> bool {
                 _ => return false,
             }
         }
-        // If a legacy input, check the script sig sighash byte
+        // If a legacy, input check the script sig sighash byte
         else if input.script_sig.is_p2pkh() || input.script_sig.is_p2sh() {
-            for instruction in input.script_sig.instructions().flatten() {
-                if let Instruction::PushBytes(data) = instruction
+            for instruction in input.script_sig.instructions() {
+                if let Ok(Instruction::PushBytes(data)) = instruction
                     && let Ok(sig) = Signature::from_slice(data.as_bytes())
                     && sig.sighash_type != EcdsaSighashType::AllPlusAnyoneCanPay
                 {
@@ -645,13 +662,14 @@ fn is_dust(out: &LocalOutput, dust_amount: &Amount) -> bool {
 }
 
 /// Checks if batching dust inputs with existing ddust transactions in the mempool
-/// produces a fee rate at least 0.1 sat/vB higher than the highest existing fee rate,
+/// produces a fee rate at least 0.01 sat/vB higher than the highest existing fee rate,
 /// as required by RBF replacement rules.
 fn should_batch(
     rpc_client: &Client,
     this_amount: Amount,
     unconfirmed_txs: &Vec<Transaction>,
     dust_utxos: &[LocalOutput],
+    output_script: &ScriptBuf,
 ) -> bool {
     // this tx fee rate > max foreign tx fee rate
     // this tx fee rate = fee / vsize
@@ -669,8 +687,12 @@ fn should_batch(
         .map(|utxo| estimate_input_vsize(&utxo.txout.script_pubkey))
         .sum::<f64>();
 
-    // when batching always use empty OP_RETURN no data, size = 11
-    tx_vsize += 11.0;
+    tx_vsize += match output_script.as_bytes() {
+        // empty OP_RETURN no data, size = 11
+        [0x6a, 0x00] => 11.0,
+        // contains 3 bytes 'ash', size = 14
+        _ => 14.0,
+    };
 
     for tx in unconfirmed_txs {
         let entry = rpc_client.get_mempool_entry(&tx.compute_txid()).unwrap();
@@ -709,7 +731,6 @@ mod test_env;
 mod tests {
     use super::*;
     use corepc_node::AddressType;
-    use test_calc::{InputType, TxSizeCalculator};
     use test_env::TestEnv;
 
     enum OpReturn {
@@ -1013,15 +1034,20 @@ mod tests {
         broadcast_and_assert(&ctx, fully_signed, 1, OpReturn::Empty);
     }
 
-    /// Test batching ddust txs via RBF
-    fn min_sats_for_batching(amt1: Amount, first_tx_vsize: f64, new_input_vsize: f64) -> Amount {
-        let fee_rate = amt1.to_sat() as f64 / first_tx_vsize;
-        let fee_rate_valid_rbf = fee_rate + 0.10;
-        Amount::from_sat((fee_rate_valid_rbf * (first_tx_vsize + new_input_vsize)) as u64) - amt1
-    }
+    /// Test batching ddust txs via RBF:
+    /// 1. Empty OP_RETURN batch (Legacy + Bech32m)
+    /// 2. Ash OP_RETURN batch (Bech32m + Bech32m)
+    /// 3. No batching when fee rate is insufficient for RBF
+    #[test]
+    fn test_spend_batch() {
+        fn min_sats_for_batching(amt1: Amount, first_tx_size: f64, new_input_size: f64) -> Amount {
+            let fee_rate = amt1.to_sat() as f64 / first_tx_size;
+            let fee_rate_valid_rbf = fee_rate + 0.10;
+            Amount::from_sat((fee_rate_valid_rbf * (first_tx_size + new_input_size)) as u64) - amt1
+        }
 
-    fn setup_ctx() -> TestContext {
         let ctx = TestContext::new();
+        let dust_sats = Amount::from_sat(600);
 
         let desc = ctx
             .env
@@ -1039,13 +1065,6 @@ mod tests {
             .env
             .get_descriptor(&ctx.wallet2_name, &AddressType::Bech32m);
         cmd_add(&ctx.secp, &ctx.db, ctx.network, &ctx.rpc_client, desc, 0);
-        ctx
-    }
-
-    /// 1. Empty OP_RETURN batch (Legacy + Bech32m)
-    #[test]
-    fn test_batch_legacy_bech32() {
-        let ctx = setup_ctx();
 
         // Case: Expect OpReturn::Empty
         let addr1 = ctx.env.new_address(&ctx.wallet1_name, &AddressType::Legacy);
@@ -1054,41 +1073,32 @@ mod tests {
         let addr2 = ctx
             .env
             .new_address(&ctx.wallet2_name, &AddressType::Bech32m);
-        let first_tx_size = TxSizeCalculator::new()
-            .add_input(InputType::P2PKH)
-            .calculate()
-            .vsize;
-        let min_sats = min_sats_for_batching(
-            amt1,
-            first_tx_size,
-            TxSizeCalculator::single_input_vsize(InputType::P2WPKH),
-        );
+        // first tx: overhead + P2PKH input + empty OP_RETURN
+        let first_tx_size = 10.5 + 148.0 + 11.0;
+        let min_sats = min_sats_for_batching(amt1, first_tx_size, 57.5);
         ctx.env
             .send_to_address(&addr2, min_sats + Amount::from_sat(10));
         ctx.env.mine_blocks(1);
 
         // first tx
-        let dust_sats = Amount::from_sat(600);
-        let psbt = cmd_spend(&ctx.db, ctx.network, &ctx.rpc_client, dust_sats, addr1).unwrap();
+        let result = cmd_spend(&ctx.db, ctx.network, &ctx.rpc_client, dust_sats, addr1);
+        assert!(result.is_some(), "expected a psbt to be created");
+
+        let psbt = result.unwrap();
         let signed = ctx.env.wallet_process_psbt(&ctx.wallet1_name, &psbt);
         broadcast_and_assert(&ctx, signed, 1, OpReturn::Empty);
 
         // spend addr2 and expect batch of the mempool ddust tx
-        let psbt_batched =
-            cmd_spend(&ctx.db, ctx.network, &ctx.rpc_client, dust_sats, addr2).unwrap();
-        let signed = ctx
-            .env
-            .wallet_process_psbt(&ctx.wallet2_name, &psbt_batched);
-        // the original tx output of OpReturn::Empty is preserved
+        let result_batch = cmd_spend(&ctx.db, ctx.network, &ctx.rpc_client, dust_sats, addr2);
+        assert!(result_batch.is_some(), "expected a psbt to be created");
+
+        let psbt = result_batch.unwrap();
+        let signed = ctx.env.wallet_process_psbt(&ctx.wallet2_name, &psbt);
+        // the orignal tx output of OpReturn::Empty is preserved
         broadcast_and_assert(&ctx, signed.clone(), 2, OpReturn::Empty);
-    }
+        ctx.env.mine_blocks(1);
 
-    /// 2. Empty OP_RETURN batch (Bech32m + Bech32m)
-    #[test]
-    fn test_batch_bech32_bech32() {
-        let ctx = setup_ctx();
-
-        // Case: Replace OpReturn::Ash with OpReturn::Empty
+        // Case: Expect OpReturn::Ash
         let addr1 = ctx
             .env
             .new_address(&ctx.wallet1_name, &AddressType::Bech32m);
@@ -1097,21 +1107,14 @@ mod tests {
         let addr2 = ctx
             .env
             .new_address(&ctx.wallet2_name, &AddressType::Bech32m);
-        let first_tx_size = TxSizeCalculator::new()
-            .add_input(InputType::P2TR)
-            .calculate()
-            .vsize;
-        let min_sats = min_sats_for_batching(
-            amt1,
-            first_tx_size,
-            TxSizeCalculator::single_input_vsize(InputType::P2TR),
-        );
+        // first tx: overhead + P2TR input + ash OP_RETURN
+        let first_tx_size = 10.5 + 57.5 + 14.0;
+        let min_sats = min_sats_for_batching(amt1, first_tx_size, 57.5);
         ctx.env
             .send_to_address(&addr2, min_sats + Amount::from_sat(10));
         ctx.env.mine_blocks(1);
 
         // first tx: spend addr1
-        let dust_sats = Amount::from_sat(600);
         let psbt = cmd_spend(&ctx.db, ctx.network, &ctx.rpc_client, dust_sats, addr1).unwrap();
         let signed = ctx.env.wallet_process_psbt(&ctx.wallet1_name, &psbt);
         broadcast_and_assert(&ctx, signed, 1, OpReturn::Ash);
@@ -1122,14 +1125,8 @@ mod tests {
         let signed = ctx
             .env
             .wallet_process_psbt(&ctx.wallet2_name, &psbt_batched);
-        // the original tx output of OpReturn::Ash is replaced by OpReturn::Empty
-        broadcast_and_assert(&ctx, signed, 2, OpReturn::Empty);
-    }
-
-    /// 3. No batching when fee rate is insufficient for RBF
-    #[test]
-    fn test_no_batch_insufficient_rate() {
-        let ctx = setup_ctx();
+        // the orignal tx output of OpReturn::Ash is preserved
+        broadcast_and_assert(&ctx, signed, 2, OpReturn::Ash);
 
         // Case: Expect no batching
         let addr1 = ctx
@@ -1140,27 +1137,20 @@ mod tests {
         let addr2 = ctx
             .env
             .new_address(&ctx.wallet2_name, &AddressType::Bech32m);
-        let first_tx_size = TxSizeCalculator::new()
-            .add_input(InputType::P2WPKH)
-            .calculate()
-            .vsize;
-        let min_sats = min_sats_for_batching(
-            amt1,
-            first_tx_size,
-            TxSizeCalculator::single_input_vsize(InputType::P2TR),
-        );
+        // first tx: overhead + P2TR input + ash OP_RETURN
+        let first_tx_size = 10.5 + 57.5 + 14.0;
+        let min_sats = min_sats_for_batching(amt1, first_tx_size, 57.5);
         // send less than min_sats to prevent a valid RBF
-        dbg!(min_sats);
-        ctx.env.send_to_address(&addr2, min_sats - Amount::ONE_SAT);
+        ctx.env
+            .send_to_address(&addr2, min_sats - Amount::from_sat(10));
         ctx.env.mine_blocks(1);
 
-        let dust_sats = Amount::from_sat(1000);
         let psbt = cmd_spend(&ctx.db, ctx.network, &ctx.rpc_client, dust_sats, addr1).unwrap();
         let signed = ctx.env.wallet_process_psbt(&ctx.wallet1_name, &psbt);
         broadcast_and_assert(&ctx, signed, 1, OpReturn::Ash);
 
-        // spend addr2 and expect this tx doesn't replace the original tx because the new fee rate
-        // is not enough to replace the mempool tx
+        // spend addr2 and expect this tx doesnt replace the original tx because new fee rate is
+        // not sufficient to replace the mempool tx
         let psbt_batched =
             cmd_spend(&ctx.db, ctx.network, &ctx.rpc_client, dust_sats, addr2).unwrap();
         let signed = ctx
