@@ -177,7 +177,7 @@ impl TestEnv {
                 &[
                     json!(psbt.to_string()),
                     json!(true),
-                    json!("NONE|ANYONECANPAY"),
+                    json!("ALL|ANYONECANPAY"),
                 ],
             )
             .unwrap();

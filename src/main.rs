@@ -233,11 +233,11 @@ fn cmd_spend(
                     tx_builder.add_data(&data);
                 }
 
-                // set script type to NONE|ANYONECANPAY
+                // set script type to ALL|ANYONECANPAY
                 if dust[0].txout.script_pubkey.is_p2tr() {
-                    tx_builder.sighash(TapSighashType::NonePlusAnyoneCanPay.into());
+                    tx_builder.sighash(TapSighashType::AllPlusAnyoneCanPay.into());
                 } else {
-                    tx_builder.sighash(EcdsaSighashType::NonePlusAnyoneCanPay.into());
+                    tx_builder.sighash(EcdsaSighashType::AllPlusAnyoneCanPay.into());
                 }
 
                 let psbt = tx_builder.finish().expect("failed to create psbt");
@@ -550,7 +550,7 @@ fn find_unconfirmed_ddust_txs(rpc_client: &Client) -> Vec<Transaction> {
 
 /// ddust pattern:
 /// has a single op_return
-/// one or more inputs with NONE|ANYONECANPAY signature type
+/// one or more inputs with ALL|ANYONECANPAY signature type
 /// op_return: can be empty or contains the string "ash"
 fn is_ddust_tx(tx: &Transaction, want_script: &Option<Vec<u8>>) -> bool {
     // Must have exactly one output
@@ -576,7 +576,7 @@ fn is_ddust_tx(tx: &Transaction, want_script: &Option<Vec<u8>>) -> bool {
         return false;
     }
 
-    // All inputs must be NONE|ANYONECANPAY
+    // All inputs must be ALL|ANYONECANPAY
     for input in &tx.input {
         if !input.witness.is_empty() {
             // If a segwit input check the witness sighash byte
@@ -584,13 +584,13 @@ fn is_ddust_tx(tx: &Transaction, want_script: &Option<Vec<u8>>) -> bool {
             match sig.len() {
                 // Taproot with explicit sighash
                 65 => {
-                    if sig[64] != TapSighashType::NonePlusAnyoneCanPay as u8 {
+                    if sig[64] != TapSighashType::AllPlusAnyoneCanPay as u8 {
                         return false;
                     }
                 }
                 // ECDSA (P2WPKH/P2WSH)
                 71..=73 => {
-                    if *sig.last().unwrap() != EcdsaSighashType::NonePlusAnyoneCanPay as u8 {
+                    if *sig.last().unwrap() != EcdsaSighashType::AllPlusAnyoneCanPay as u8 {
                         return false;
                     }
                 }
@@ -603,7 +603,7 @@ fn is_ddust_tx(tx: &Transaction, want_script: &Option<Vec<u8>>) -> bool {
             for instruction in input.script_sig.instructions().flatten() {
                 if let Instruction::PushBytes(data) = instruction
                     && let Ok(sig) = Signature::from_slice(data.as_bytes())
-                    && sig.sighash_type != EcdsaSighashType::NonePlusAnyoneCanPay
+                    && sig.sighash_type != EcdsaSighashType::AllPlusAnyoneCanPay
                 {
                     return false;
                 }
