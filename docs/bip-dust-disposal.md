@@ -70,8 +70,8 @@ A compliant dust disposal transaction MUST satisfy all the following requirement
 #### Inputs
 
 1. All inputs MUST set the nSequence to 0xFFFFFFFF (do not signal for BIP 125 RBF).
-2. All inputs MUST use the signature hash type `NONE|ANYONECANPAY` (0x81).
-3. For Taproot (P2TR) inputs using key-path spending, implementations MUST explicitly append the signature hash type byte `NONE|ANYONECANPAY` (0x81) to enable ANYONECANPAY semantics, as the default sighash for Taproot (SIGHASH_DEFAULT, which omits the byte) does not include ANYONECANPAY.
+2. All inputs MUST use the signature hash type `ALL|ANYONECANPAY` (0x81).
+3. For Taproot (P2TR) inputs using key-path spending, implementations MUST explicitly append the signature hash type byte `ALL|ANYONECANPAY` (0x81) to enable ANYONECANPAY semantics, as the default sighash for Taproot (SIGHASH_DEFAULT, which omits the byte) does not include ANYONECANPAY.
 4. All inputs must be confirmed in the blockchain at least one block deep.
 
 #### Transaction Size
@@ -115,7 +115,7 @@ Multiple unconfirmed dust disposal transactions created by unrelated entities ca
 1. Pre-signed dust inputs MUST be collected from the public bitcoin network mempool.
 2. Inputs MUST NOT be received directly from other wallet users.
 3. The batch creator MUST add a new dust UTXO input to meet the RBF rules requiring an improved fee amount and rate.
-4. The single output MUST be changed to an empty OP_RETURN. The "ash" message is not needed.
+4. All inputs MUST be spent to the same OP_RETURN output, empty or with the `ash` value.
 
 Batch dust disposal transactions must follow all other transaction construction requirements for non-batched dust disposal transactions.
 
@@ -164,18 +164,18 @@ Bitcoin relay policy enforces a minimum transaction base size of 65 bytes to pre
 
 Dust disposal transactions must meet the minimum relay fee rate, which is currently 0.1 sat/vB (Bitcoin Core 28.3, 29.1, 30.0+). This allows dust UTXOs to be disposed of economically even when their value is small. Implementations targeting older node versions may need higher minimum fee rates.
 
-### Why Sighash NONE | ANYONECANPAY?
+### Why Sighash `ALL|ANYONECANPAY`?
 
-The NONE sighash flag means that the signature does not commit to any outputs of the transaction. This means anyone can modify the output of the dust disposal transaction after signing. To use as little block space as possible when batching dust UTXOs, we need to be able to replace an "ash" OP_RETURN output with an empty OP_RETURN. 
+The ALL sighash flag means that the signature commits to all outputs of the transaction. This means signed dust inputs can only be spent to the special OP_RETURN output of a dust disposal transaction.
 
-The ANYONECANPAY sighash flag means that the signature does not commit to any inputs of the transaction. This means anyone can add additional inputs to the dust disposal transaction after signing. When batching dust UTXOs, we do not care which dust UTXOs are spent together as long as they do not associate addresses owned by the same entity.
+The ANYONECANPAY sighash flag means that the signature only commits to the one input being signed. This means anyone can add additional inputs to the dust disposal transaction after signing. When batching dust UTXOs, we do not care which dust UTXOs are spent together as long as they do not associate addresses owned by the same entity.
 
 Together these flags enable:
 
 - **Batching**: A new dust input can be added to an unconfirmed dust disposal transaction found in the mempool and batched together via RBF.
-- **User privacy**: Transactions shared via the public mempool do not reveal user identity metadata.
-- **Fee Bumping**: Additional inputs can be added by unrelated third parties to increase the fee rate.
-- **Efficiency**: An empty OP_RETURN can always be used when adding an input to an existing unconfirmed disposal transaction. 
+- **User privacy**: Dust disposal transactions shared via the public mempool do not reveal user identity metadata.
+- **Fee Bumping**: Additional inputs can be added by unrelated third parties to improve the fee rate.
+- **Limited RBF**: By committing dust inputs to a single `OP_RETURN` output we restrict these inputs to only being spent with other disposal inputs. This limits the number of valid conflicting RBF transactions that can be created and relayed.
 
 ### Why nLockTime block height 0
 
@@ -192,11 +192,11 @@ Together these flags enable:
 
 This BIP introduces no changes to the Bitcoin consensus rules or peer-to-peer protocol. All transactions conforming to this specification are valid under existing consensus rules and can be relayed by nodes supporting:
 
+- Sighash `ALL|ANYONECANPAY` (original Bitcoin feature)
 - OP_RETURN outputs (Bitcoin Core 0.9.0+)
-- SIGHASH_ANYONECANPAY (original Bitcoin feature)
+- RBF (Replace by Fee) BIP 125 (Bitcoin Core 0.12.0+)
 - 0.1 sat/vB minimum relay fee (Bitcoin Core 28.3, 29.1, 30.0+)
 - Private transaction broadcast (Bitcoin Core 31.0+)
-- RBF (Replace by Fee) BIP 125
 
 Nodes that do not relay transactions with fee rates below 1 sat/vB could slow the propagation of disposal transactions with lower fee rates.
 
@@ -209,7 +209,7 @@ The implementation provides:
 - Automatic dust detection based on configurable thresholds
 - Transaction batching via RBF
 - Support for P2PKH, P2SH, P2WPKH, P2WSH, and P2TR input descriptors
-- Integration with Bitcoin Core 30.0+ via RPC for syncing and broadcasting transactions
+- Integration with Bitcoin Core (version 30.0+) via RPC for syncing and broadcasting transactions
 
 ## Test Cases
 
@@ -255,7 +255,7 @@ All valid dust disposal transactions should be verified to be accepted into the 
 ### Batching dust disposal txs via RBF
 
 1. Adding a Bech32m dust input to an unconfirmed disposal transaction with a legacy dust input keeps the original single empty OP_RETURN output.
-2. Adding a Bech32m dust input to an unconfirmed disposal transaction with a Bech32m dust input changes the original single "ash" OP_RETURN output to an empty OP_RETURN output.
+2. Adding a Bech32m dust input to an unconfirmed disposal transaction with a Bech32m dust input keeps the original single "ash" OP_RETURN output.
 3. Adding a new dust input to an unconfirmed disposal transaction results in a new batch disposal transaction with a fee rate sufficient for RBF.
 4. A new dust input that contributes an insufficient amount for RBF with an existing unconfirmed disposal transaction is not batched with it.
 
