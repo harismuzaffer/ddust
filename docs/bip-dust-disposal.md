@@ -114,8 +114,14 @@ Multiple unconfirmed dust disposal transactions created by unrelated entities ca
 
 1. Pre-signed dust inputs MUST be collected from the public bitcoin network mempool.
 2. Inputs MUST NOT be received directly from other wallet users.
-3. The batch creator MUST add a new dust UTXO input to meet the RBF rules requiring an improved fee amount and rate.
-4. All inputs MUST be spent to the same OP_RETURN output, empty or with the `ash` value.
+3. All inputs MUST be spent to the same OP_RETURN output, empty or with the `ash` value.
+4. The batch creator MUST add a new dust UTXO input and the resulting replacement transaction MUST satisfy BIP 125 RBF rules:
+   - The replacement transaction's absolute fee MUST be at least the sum of the absolute fees of all replaced transactions. In dust disposal transactions this is inherently satisfied because the batcher's new input contributes additional sats that all become fee.
+   - The replacement transaction MUST pay an additional fee of at least the incremental relay fee rate (0.1 sat/vB) multiplied by the replacement transaction's virtual size. Since all input sats become fee in a dust disposal transaction, this reduces to: the sum of the batcher's new dust input values MUST be at least 0.1 sat/vB multiplied by the replacement transaction's virtual size.
+   - The replacement transaction's fee rate MUST exceed the fee rate of every transaction it replaces.
+   - The replacement transaction MUST NOT cause the eviction of more than 100 transactions from the mempool.
+
+5. Unconfirmed dust disposal transactions MUST be sorted in ascending order by fee rate before selecting which to batch. The batch creator MUST iterate through this sorted list and greedily include transactions until an RBF rule is not met. This deterministic ordering ensures all compliant implementations produce the same batch for the same mempool state, preventing implementation fingerprinting.
 
 Batch dust disposal transactions must follow all other transaction construction requirements for non-batched dust disposal transactions.
 
