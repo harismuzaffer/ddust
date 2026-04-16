@@ -170,7 +170,28 @@ Another thing I was excited about was adding the feature that allows external ag
 I am also looking into the new feature of allowing broadcasting ddust txs using `privatebroadcast`. Note that `privatebroadcast` is available from [core 31.0](https://github.com/bitcoin-core/bitcoin-devwiki/wiki/31.0-Release-Notes-Draft#p2p-and-network-changes) and onwards, check [bitcoin/bitcoin#29415](https://github.com/bitcoin/bitcoin/pull/29415). `privatebroadcast` uses a new short-lived Tor or I2P connections to broadcast each transaction without linking it to the IP address of the sending node
 
 ### Next Steps
-- Colloborate with Bubb1es on the new github [issues](https://github.com/bubb1es71/ddust/issues/)
+- Collaborate with Bubb1es on the new github [issues](https://github.com/bubb1es71/ddust/issues/)
+
+---
+
+## [16.04.2026] - RBF-compliant batching, revert to `ALL|ANYONECANPAY`
+
+### Merged
+- [x] [PR #28](https://github.com/bubb1es71/ddust/pull/28) - Bubb1es' sighash `NONE|ANYONECANPAY` transition (reviewed and merged)
+- [x] Revert of PR #28 - reverted back to `ALL|ANYONECANPAY` based on Murch's feedback on the [bitcoindev mailing list](https://groups.google.com/g/bitcoindev/c/pr1z3_j8vTc/m/DqMYltO_AAAJ). The concern: `NONE|ANYONECANPAY` lets third parties scrape signed inputs from the mempool and use them to subsidize their own transactions for free. At current fee rates (~0.12 s/vB), each P2TR dust input is profitable to steal up to ~5.72 s/vB. This creates a replacement-war incentive and wastes relay bandwidth. `ALL|ANYONECANPAY` prevents this by locking the output to the OP_RETURN, so stolen inputs can only be spent to the same burn output
+
+### In Progress
+- [x] [Issue #30](https://github.com/bubb1es71/ddust/issues/30) - Fix batching to follow RBF rules. [PR](https://github.com/bubb1es71/ddust/pull/32) is ready for review.
+
+### Journal
+As part of the [PR](https://github.com/bubb1es71/ddust/pull/32), I refactored batching eligibility logic - instead of batching all-or-nothing, we can now batch a subset of unconfirmed ddust txs. The function sorts mempool txs ascending by fee rate and greedily includes each if the replacement satisfies all BIP 125 RBF rules: absolute fee >= sum of replaced fees (inherently satisfied since each input contributes > 0 sats), additional fee covers bandwidth (0.1 sat/vB * replacement vsize), replacement rate exceeds every replaced tx's rate, and no more than 100 evictions. The ascending sort + break-on-first-failure approach is deterministic - all compliant implementations produce the same batch for the same mempool state, preventing implementation fingerprinting.
+
+Also refactored test fn `min_sats_for_batching` to correctly model both the rate and bandwidth RBF constraints, and updated batch tests to derive dust amounts from it.
+
+Updated the BIP spec batching section to spell out the RBF rules and the deterministic sort order.
+
+### Next Steps
+- Work on open [issues](https://github.com/bubb1es71/ddust/issues/) in the ddust repo
 
 ---
 
