@@ -170,7 +170,57 @@ Another thing I was excited about was adding the feature that allows external ag
 I am also looking into the new feature of allowing broadcasting ddust txs using `privatebroadcast`. Note that `privatebroadcast` is available from [core 31.0](https://github.com/bitcoin-core/bitcoin-devwiki/wiki/31.0-Release-Notes-Draft#p2p-and-network-changes) and onwards, check [bitcoin/bitcoin#29415](https://github.com/bitcoin/bitcoin/pull/29415). `privatebroadcast` uses a new short-lived Tor or I2P connections to broadcast each transaction without linking it to the IP address of the sending node
 
 ### Next Steps
-- Colloborate with Bubb1es on the new github [issues](https://github.com/bubb1es71/ddust/issues/)
+- Collaborate with Bubb1es on the new github [issues](https://github.com/bubb1es71/ddust/issues/)
+
+---
+
+## [16.04.2026] - RBF-compliant batching, revert to `ALL|ANYONECANPAY`
+
+### Merged
+- [x] [PR #28](https://github.com/bubb1es71/ddust/pull/28) - Bubb1es' sighash `NONE|ANYONECANPAY` transition (reviewed and merged)
+- [x] Revert of PR #28 - reverted back to `ALL|ANYONECANPAY` based on Murch's feedback on the [bitcoindev mailing list](https://groups.google.com/g/bitcoindev/c/pr1z3_j8vTc/m/DqMYltO_AAAJ). The concern: `NONE|ANYONECANPAY` lets third parties scrape signed inputs from the mempool and use them to subsidize their own transactions for free. At current fee rates (~0.12 s/vB), each P2TR dust input is profitable to steal up to ~5.72 s/vB. This creates a replacement-war incentive and wastes relay bandwidth. `ALL|ANYONECANPAY` prevents this by locking the output to the OP_RETURN, so stolen inputs can only be spent to the same burn output
+
+### In Progress
+- [x] [Issue #30](https://github.com/bubb1es71/ddust/issues/30) - Fix batching to follow RBF rules. [PR](https://github.com/bubb1es71/ddust/pull/32) is ready for review.
+
+### Journal
+As part of the [PR](https://github.com/bubb1es71/ddust/pull/32), I refactored batching eligibility logic - instead of batching all-or-nothing, we can now batch a subset of unconfirmed ddust txs. The function sorts mempool txs ascending by fee rate and greedily includes each if the replacement satisfies all BIP 125 RBF rules: absolute fee >= sum of replaced fees (inherently satisfied since each input contributes > 0 sats), additional fee covers bandwidth (0.1 sat/vB * replacement vsize), replacement rate exceeds every replaced tx's rate, and no more than 100 evictions. The ascending sort + break-on-first-failure approach is deterministic - all compliant implementations produce the same batch for the same mempool state, preventing implementation fingerprinting.
+
+Also refactored test fn `min_sats_for_batching` to correctly model both the rate and bandwidth RBF constraints, and updated batch tests to derive dust amounts from it.
+
+Updated the BIP spec batching section to spell out the RBF rules and the deterministic sort order.
+
+### Next Steps
+- Work on open [issues](https://github.com/bubb1es71/ddust/issues/) in the ddust repo
+
+---
+
+## [29.04.2026] - Low-R signature grinding, BIP submitted to bitcoin/bips
+
+### Merged
+- [x] [PR #32](https://github.com/bubb1es71/ddust/pull/32) - [Issue #30](https://github.com/bubb1es71/ddust/issues/30) Fix batching to follow RBF rules
+- [x] [PR #35](https://github.com/bubb1es71/ddust/pull/35) - [Issue #23](https://github.com/bubb1es71/ddust/issues/23) Assume low-R grinded ECDSA signatures (71 bytes) and update size calcs, fee-rate estimates, BIP tables; fix batching logic to account for the 1-byte empty witness-stack counter each legacy input incurs in a segwit tx; fix `min_sats_for_batching` to preserve the orig's OP_RETURN; refactor `find_batchable_txs`; add more batching combinations and multi-input replacement test scenarios
+
+### In Review
+- [Bitcoin BIPs PR #2150](https://github.com/bitcoin/bips/pull/2150) - The ddust BIP proposal raised on the upstream `bitcoin/bips` repo. Currently under review.
+
+### Journal
+PR #35 (Issue #23) was the bigger piece of work this cycle. ECDSA signatures in Bitcoin can vary in length depending on the random nonce `k` chosen during signing - the resulting `r` and `s` values can each be 32 or 33 bytes in DER encoding, leading to total signature sizes of 71-73 bytes. Bitcoin Core has been doing low-R grinding by default since 0.17, which retries the signing nonce until the high bit of `r` is 0, guaranteeing `r` is always 32 bytes. Combined with mandatory low-S enforcement (BIP146, since 2015), this makes signatures almost always 71 bytes (with the appended sighash byte). Since `ddust` only produces transactions through wallets that grind low-R, I updated all our size calculations to assume 71-byte sigs everywhere - the `TxSizeCalculator`, the BIP transaction-size and fee-rate tables, etc.
+
+While doing that, I also discovered two related size-accounting bugs in `find_batchable_txs`:
+- The replacement transaction is a segwit tx the moment any input is a witness program. Segwit serialization adds two costs over a pure-legacy tx: 0.5 vb for the per-tx marker+flag (paid once), and 0.25 vb per legacy input (the empty witness-stack counter byte). The earlier code only accounted for the marker+flag; legacy inputs in a segwit tx were being undercounted by 0.25 vb each, which in mixed cases produced replacements that fell below the BIP125 fee-rate threshold and got rejected by mempool.
+- fixed the utils fns for test - `min_sats_for_batching` and `calculate()` to adjust the input sizes when a legacy input is encountered in a segwit tx
+
+I also took the opportunity to refactor `find_batchable_txs` for readability. Logic unchanged.
+
+Test side: extracted the common scaffolding from the batch tests into `run_batch_test`, which takes the original tx's input shape (a list of `(AddressType, InputType, Amount)`) and the replacement's input shape (a list of `(AddressType, InputType)`). Added all 9 single-input × single-batcher combinations across (Bech32m, Bech32, Legacy), then 6 multi-input scenarios on the original side. Each test now declares only the parameters that actually vary - addr1 type, input type, count, amount, addr2 type, input type, expected OP_RETURN.
+
+On the BIP side: we raised PR #2150 in `bitcoin/bips`. Currently in review. The active discussion is whether to keep two OP_RETURN variants (empty for non-witness, "ash" for single-witness-input padding) or standardize on always-"ash". The reviewer's argument for always-"ash" is compelling: the 3-byte tax breaks even at a 1-in-7 merge rate (since each successful batch saves ~21 bytes by eliminating one tx's overhead), and it makes every ddust tx mergeable with every other instead of partitioning the mempool into two non-cross-mergeable pools. We're leaning toward accepting that simplification.
+
+
+### Next Steps
+- Address review feedback on [Bitcoin BIPs PR #2150](https://github.com/bitcoin/bips/pull/2150) - decide on always-"ash" vs two-variant OP_RETURN
+- Continue working through open [issues](https://github.com/bubb1es71/ddust/issues/) in the ddust repo
 
 ---
 
