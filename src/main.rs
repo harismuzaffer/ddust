@@ -180,7 +180,6 @@ fn cmd_spend(
                         batchable_txs.len(),
                         unconfirmed_txs.len()
                     );
-                    num_inputs += batchable_txs.len();
                     input_amount += add_foreign_utxos(rpc_client, &mut tx_builder, &batchable_txs);
                 }
 
@@ -518,6 +517,7 @@ fn find_unconfirmed_ddust_txs(rpc_client: &Client) -> Vec<Transaction> {
                 let script_bytes = tx.output[0].script_pubkey.as_bytes().to_vec();
                 first_found_script = Some(script_bytes);
             }
+
             unconfirmed_txs.push(tx);
         }
     }
@@ -777,6 +777,8 @@ mod test_env;
 
 #[cfg(test)]
 mod tests {
+    use crate::test_calc::{InputType, TxSizeCalculator};
+
     use super::*;
     use corepc_node::AddressType;
     use test_env::TestEnv;
@@ -1056,9 +1058,11 @@ mod tests {
     fn test_spend_multisig() {
         let ctx = TestContext::new();
 
-        let (addr, desc) = ctx
-            .env
-            .create_multisig(&[&ctx.wallet1_name, &ctx.wallet2_name], 2);
+        let (addr, desc) = ctx.env.create_multisig(
+            &[&ctx.wallet1_name, &ctx.wallet2_name],
+            2,
+            &AddressType::Legacy,
+        );
 
         cmd_add(&ctx.secp, &ctx.db, ctx.network, &ctx.rpc_client, desc, 0);
         ctx.env.send_to_address(&addr, Amount::from_sat(555));
@@ -1082,24 +1086,39 @@ mod tests {
         broadcast_and_assert(&ctx, fully_signed, 1, OpReturn::Empty);
     }
 
-    /// Test batching ddust txs via RBF:
-    /// 1. Empty OP_RETURN batch (Legacy + Bech32m)
-    /// 2. Ash OP_RETURN batch (Bech32m + Bech32m)
-    /// 3. No batching when fee rate is insufficient for RBF
-    #[test]
-    fn test_spend_batch() {
-        fn min_sats_for_batching(amt1: Amount, first_tx_size: f64, new_input_size: f64) -> Amount {
-            let fee_rate = amt1.to_sat() as f64 / first_tx_size;
-            let fee_rate_valid_rbf = fee_rate + 0.10;
-            Amount::from_sat((fee_rate_valid_rbf * (first_tx_size + new_input_size)) as u64) - amt1
+    /// Minimum sats the batcher's dust must be worth for the replacement to satisfy RBF.
+    /// The replacement must:
+    ///  - have a higher fee rate than the replaced tx
+    ///  - pay for its own bandwidth (incremental relay fee: 0.1 sat/vB * replacement vsize)
+    fn min_sats_for_batching(
+        orig_tx_fee: Amount,
+        orig_tx_input_types: &[InputType],
+        replacement_tx_input_type: InputType,
+    ) -> Amount {
+        let mut orig_tx = TxSizeCalculator::new();
+        for input_type in orig_tx_input_types {
+            orig_tx = orig_tx.add_input(*input_type);
         }
-
+        let orig_tx_vsize = orig_tx.calculate().vsize.ceil();
+        let replacement_tx = orig_tx.add_input(replacement_tx_input_type);
+        let replacement_tx_vsize = replacement_tx.calculate().vsize.ceil();
+        let fee_rate = orig_tx_fee.to_sat() as f64 / orig_tx_vsize;
+        // requires atleast `sats` at the fee rate of the original tx
+        let rate_min_sats = (fee_rate * replacement_tx_vsize) as u64 - orig_tx_fee.to_sat();
+        // requires `sats` that pay the replacement_vsize at the relay rate
+        let bandwidth_min_sats = (0.1 * replacement_tx_vsize) as u64;
+        Amount::from_sat(bandwidth_min_sats.max(rate_min_sats))
+    }
+    fn setup_ctx() -> TestContext {
         let ctx = TestContext::new();
-        let dust_sats = Amount::from_sat(600);
 
         let desc = ctx
             .env
             .get_descriptor(&ctx.wallet1_name, &AddressType::Legacy);
+        cmd_add(&ctx.secp, &ctx.db, ctx.network, &ctx.rpc_client, desc, 0);
+        let desc = ctx
+            .env
+            .get_descriptor(&ctx.wallet1_name, &AddressType::Bech32);
         cmd_add(&ctx.secp, &ctx.db, ctx.network, &ctx.rpc_client, desc, 0);
         let desc = ctx
             .env
@@ -1113,6 +1132,18 @@ mod tests {
             .env
             .get_descriptor(&ctx.wallet2_name, &AddressType::Bech32m);
         cmd_add(&ctx.secp, &ctx.db, ctx.network, &ctx.rpc_client, desc, 0);
+        let desc = ctx
+            .env
+            .get_descriptor(&ctx.wallet2_name, &AddressType::Bech32);
+        cmd_add(&ctx.secp, &ctx.db, ctx.network, &ctx.rpc_client, desc, 0);
+
+        ctx
+    }
+
+    /// 1. Empty OP_RETURN batch (Legacy + Bech32m)
+    #[test]
+    fn test_batch_legacy_bech32() {
+        let ctx = setup_ctx();
 
         // Case: Expect OpReturn::Empty
         let addr1 = ctx.env.new_address(&ctx.wallet1_name, &AddressType::Legacy);
@@ -1121,32 +1152,33 @@ mod tests {
         let addr2 = ctx
             .env
             .new_address(&ctx.wallet2_name, &AddressType::Bech32m);
-        // first tx: overhead + P2PKH input + empty OP_RETURN
-        let first_tx_size = 10.5 + 148.0 + 11.0;
-        let min_sats = min_sats_for_batching(amt1, first_tx_size, 57.5);
-        ctx.env
-            .send_to_address(&addr2, min_sats + Amount::from_sat(10));
+        let min_sats = min_sats_for_batching(amt1, &[InputType::P2PKH], InputType::P2WPKH);
+        ctx.env.send_to_address(&addr2, min_sats + Amount::ONE_SAT);
         ctx.env.mine_blocks(1);
 
         // first tx
-        let result = cmd_spend(&ctx.db, ctx.network, &ctx.rpc_client, dust_sats, addr1);
-        assert!(result.is_some(), "expected a psbt to be created");
-
-        let psbt = result.unwrap();
+        let dust_sats = Amount::from_sat(600);
+        let psbt = cmd_spend(&ctx.db, ctx.network, &ctx.rpc_client, dust_sats, addr1).unwrap();
         let signed = ctx.env.wallet_process_psbt(&ctx.wallet1_name, &psbt);
         broadcast_and_assert(&ctx, signed, 1, OpReturn::Empty);
 
         // spend addr2 and expect batch of the mempool ddust tx
-        let result_batch = cmd_spend(&ctx.db, ctx.network, &ctx.rpc_client, dust_sats, addr2);
-        assert!(result_batch.is_some(), "expected a psbt to be created");
-
-        let psbt = result_batch.unwrap();
-        let signed = ctx.env.wallet_process_psbt(&ctx.wallet2_name, &psbt);
-        // the orignal tx output of OpReturn::Empty is preserved
+        let psbt_batched =
+            cmd_spend(&ctx.db, ctx.network, &ctx.rpc_client, dust_sats, addr2).unwrap();
+        let signed = ctx
+            .env
+            .wallet_process_psbt(&ctx.wallet2_name, &psbt_batched);
+        // the original tx output of OpReturn::Empty is preserved
         broadcast_and_assert(&ctx, signed.clone(), 2, OpReturn::Empty);
-        ctx.env.mine_blocks(1);
+    }
 
-        // Case: Expect OpReturn::Ash
+    /// 2. OpReturn:Ash OP_RETURN batch (Bech32m + Bech32m)
+    #[test]
+    fn test_batch_bech32_bech32() {
+        let ctx = setup_ctx();
+
+        // Case: The first Bech32m spend outputs an OpReturn:Ash, the second Bech32m spend
+        // keeps op_return:Ash from the replaced tx
         let addr1 = ctx
             .env
             .new_address(&ctx.wallet1_name, &AddressType::Bech32m);
@@ -1155,14 +1187,12 @@ mod tests {
         let addr2 = ctx
             .env
             .new_address(&ctx.wallet2_name, &AddressType::Bech32m);
-        // first tx: overhead + P2TR input + ash OP_RETURN
-        let first_tx_size = 10.5 + 57.5 + 14.0;
-        let min_sats = min_sats_for_batching(amt1, first_tx_size, 57.5);
-        ctx.env
-            .send_to_address(&addr2, min_sats + Amount::from_sat(10));
+        let min_sats = min_sats_for_batching(amt1, &[InputType::P2TR], InputType::P2TR);
+        ctx.env.send_to_address(&addr2, min_sats + Amount::ONE_SAT);
         ctx.env.mine_blocks(1);
 
         // first tx: spend addr1
+        let dust_sats = Amount::from_sat(600);
         let psbt = cmd_spend(&ctx.db, ctx.network, &ctx.rpc_client, dust_sats, addr1).unwrap();
         let signed = ctx.env.wallet_process_psbt(&ctx.wallet1_name, &psbt);
         broadcast_and_assert(&ctx, signed, 1, OpReturn::Ash);
@@ -1173,8 +1203,14 @@ mod tests {
         let signed = ctx
             .env
             .wallet_process_psbt(&ctx.wallet2_name, &psbt_batched);
-        // the orignal tx output of OpReturn::Ash is preserved
+        // the original tx output of OpReturn::Ash is preserved
         broadcast_and_assert(&ctx, signed, 2, OpReturn::Ash);
+    }
+
+    /// 3. No batching when fee rate is insufficient for RBF
+    #[test]
+    fn test_no_batch_insufficient_rate() {
+        let ctx = setup_ctx();
 
         // Case: Expect no batching
         let addr1 = ctx
@@ -1185,25 +1221,196 @@ mod tests {
         let addr2 = ctx
             .env
             .new_address(&ctx.wallet2_name, &AddressType::Bech32m);
-        // first tx: overhead + P2TR input + ash OP_RETURN
-        let first_tx_size = 10.5 + 57.5 + 14.0;
-        let min_sats = min_sats_for_batching(amt1, first_tx_size, 57.5);
+        let min_sats = min_sats_for_batching(amt1, &[InputType::P2WPKH], InputType::P2TR);
         // send less than min_sats to prevent a valid RBF
-        ctx.env
-            .send_to_address(&addr2, min_sats - Amount::from_sat(10));
+        dbg!(min_sats);
+        ctx.env.send_to_address(&addr2, min_sats - Amount::ONE_SAT);
         ctx.env.mine_blocks(1);
 
+        let dust_sats = Amount::from_sat(1000);
         let psbt = cmd_spend(&ctx.db, ctx.network, &ctx.rpc_client, dust_sats, addr1).unwrap();
         let signed = ctx.env.wallet_process_psbt(&ctx.wallet1_name, &psbt);
         broadcast_and_assert(&ctx, signed, 1, OpReturn::Ash);
 
-        // spend addr2 and expect this tx doesnt replace the original tx because new fee rate is
-        // not sufficient to replace the mempool tx
+        // spend addr2 and expect this tx doesn't replace the original tx because the new fee rate
+        // is not enough to replace the mempool tx
         let psbt_batched =
             cmd_spend(&ctx.db, ctx.network, &ctx.rpc_client, dust_sats, addr2).unwrap();
         let signed = ctx
             .env
             .wallet_process_psbt(&ctx.wallet2_name, &psbt_batched);
         broadcast_and_assert(&ctx, signed, 1, OpReturn::Ash);
+    }
+
+    /// 4. picks batchable unconfirmed ddust txs
+    ///
+    /// Setup: steps 1 creates the first ddust tx, step 2 creates another and batches the previous tx
+    /// Steps 3 and 4 sends just under `min_sats_for_batching` (against the
+    /// lowest-rate existing tx), so each step is forced to stand alone. Step 5 sends a
+    /// large enough P2TR dust and batches one unconfirmed tx, leaving other txs unbatched
+    ///
+    /// Input types (each at its own address): P2TR, P2TR, P2PKH, P2WPKH, P2TR (batcher).
+    #[test]
+    fn test_batch_pick_batchable() {
+        let ctx = setup_ctx();
+
+        // addresses
+        let addr1 = ctx
+            .env
+            .new_address(&ctx.wallet1_name, &AddressType::Bech32m);
+        let addr2 = ctx
+            .env
+            .new_address(&ctx.wallet2_name, &AddressType::Bech32m);
+        let addr3 = ctx.env.new_address(&ctx.wallet1_name, &AddressType::Legacy);
+        let addr4 = ctx.env.new_address(&ctx.wallet1_name, &AddressType::Bech32);
+        let addr5 = ctx
+            .env
+            .new_address(&ctx.wallet2_name, &AddressType::Bech32m);
+
+        // step 1: any valid starting dust (no mempool ddust yet).
+        let amt1 = Amount::from_sat(300);
+        ctx.env.send_to_address(&addr1, amt1);
+
+        // step 2 (new P2TR input): > min_sats_for_batching(tx1) batches the previous p2tr input.
+        let min_sats_p2tr_p2tr = min_sats_for_batching(amt1, &[InputType::P2TR], InputType::P2TR);
+        let amt_batch_p2tr_p2tr = min_sats_p2tr_p2tr + Amount::ONE_SAT;
+        ctx.env.send_to_address(&addr2, amt_batch_p2tr_p2tr);
+
+        // step 3 (new P2PKH input): doesn't batch
+        let min_sats_batchedp2tr_p2pkh = min_sats_for_batching(
+            amt1 + amt_batch_p2tr_p2tr,
+            &[InputType::P2TR, InputType::P2TR],
+            InputType::P2PKH,
+        );
+        let amt_no_batch_2p2tr_p2pkh = min_sats_batchedp2tr_p2pkh - Amount::ONE_SAT;
+        ctx.env.send_to_address(&addr3, amt_no_batch_2p2tr_p2pkh);
+
+        // step 4 (new P2WPKH input): doesn't batch
+        let min_sats_p2wpkh = min_sats_for_batching(
+            amt_no_batch_2p2tr_p2pkh,
+            &[InputType::P2PKH],
+            InputType::P2WPKH,
+        );
+        let amt_p2wpkh_no_batch = min_sats_p2wpkh - Amount::ONE_SAT;
+        ctx.env.send_to_address(&addr4, amt_p2wpkh_no_batch);
+
+        // step 5 (new P2TR input): just enough to batch the P2WPKH input
+        let amt_p2tr_batch = amt_p2wpkh_no_batch + Amount::ONE_SAT;
+        ctx.env.send_to_address(&addr5, amt_p2tr_batch);
+
+        ctx.env.mine_blocks(1);
+
+        let dust_sats = Amount::from_sat(2500);
+
+        // 1. spend addr1 - standalone (no mempool ddust yet)
+        let psbt = cmd_spend(&ctx.db, ctx.network, &ctx.rpc_client, dust_sats, addr1).unwrap();
+        let signed = ctx.env.wallet_process_psbt(&ctx.wallet1_name, &psbt);
+        broadcast_and_assert(&ctx, signed, 1, OpReturn::Ash);
+
+        // 2. spend addr2 - batches input from previous tx
+        let psbt = cmd_spend(&ctx.db, ctx.network, &ctx.rpc_client, dust_sats, addr2).unwrap();
+        let signed = ctx.env.wallet_process_psbt(&ctx.wallet2_name, &psbt);
+        broadcast_and_assert(&ctx, signed, 2, OpReturn::Ash);
+
+        // 3. spend addr3 - standalone (P2PKH amount below the lowest batch threshold)
+        let psbt = cmd_spend(&ctx.db, ctx.network, &ctx.rpc_client, dust_sats, addr3).unwrap();
+        let signed = ctx.env.wallet_process_psbt(&ctx.wallet1_name, &psbt);
+        broadcast_and_assert(&ctx, signed, 1, OpReturn::Empty);
+
+        // 4. spend addr4 - standalone (P2WPKH amount below the lowest batch threshold)
+        let psbt = cmd_spend(&ctx.db, ctx.network, &ctx.rpc_client, dust_sats, addr4).unwrap();
+        let signed = ctx.env.wallet_process_psbt(&ctx.wallet1_name, &psbt);
+        broadcast_and_assert(&ctx, signed, 1, OpReturn::Ash);
+
+        // 5. spend addr5 - batches 1 unconfirmed tx into a single 2-input replacement.
+        let psbt = cmd_spend(&ctx.db, ctx.network, &ctx.rpc_client, dust_sats, addr5).unwrap();
+        let signed = ctx.env.wallet_process_psbt(&ctx.wallet2_name, &psbt);
+        broadcast_and_assert(&ctx, signed, 2, OpReturn::Ash);
+    }
+
+    /// 5. test BIP 125 mempool eviction limit that limits how many unconfirmed txs you can
+    ///    replace. The limit currently set to 100
+    #[test]
+    fn test_batch_mempool_eviction_limit() {
+        let ctx = setup_ctx();
+
+        let mut addressses = vec![];
+        // create > 100 dust UTXOs
+        for i in 0..120 {
+            let addr = ctx
+                .env
+                .new_address(&ctx.wallet1_name, &AddressType::Bech32m);
+            ctx.env.send_to_address(&addr, Amount::from_sat(300));
+            addressses.push(addr);
+            // mine periodically to prevent chain of transactions
+            if i % 20 == 0 {
+                ctx.env.mine_blocks(1);
+            }
+        }
+        // a large UTXO will be used to batch all the unconfirmed ddust txs(upto 100)
+        let addr_batcher1 = ctx
+            .env
+            .new_address(&ctx.wallet1_name, &AddressType::Bech32m);
+        ctx.env
+            .send_to_address(&addr_batcher1, Amount::from_sat(1000));
+        // another large UTXO will be used to batch all remaining 20 unconfirmed ddust txs
+        let addr_batcher2 = ctx
+            .env
+            .new_address(&ctx.wallet1_name, &AddressType::Bech32m);
+        ctx.env
+            .send_to_address(&addr_batcher2, Amount::from_sat(1000));
+
+        ctx.env.mine_blocks(1);
+
+        let dust_sats = Amount::from_sat(1000);
+
+        // spend each dust UTXO as a standalone ddust tx, mining a block after each
+        // to confirm it (preventing batching)
+        for addr in addressses {
+            let psbt = cmd_spend(&ctx.db, ctx.network, &ctx.rpc_client, dust_sats, addr).unwrap();
+            let signed = ctx.env.wallet_process_psbt(&ctx.wallet1_name, &psbt);
+            broadcast_and_assert(&ctx, signed, 1, OpReturn::Ash);
+            ctx.env.mine_blocks(1);
+        }
+
+        // invalidate blocks to put all 120 ddust txs back into the mempool
+        let count: serde_json::Value = ctx.env.node.client.call("getblockcount", &[]).unwrap();
+        let target_height = count.as_u64().unwrap() - 120;
+        // repeatedly invalidate the current tip until target_height is reached
+        loop {
+            let tip = ctx.env.node.client.call("getbestblockhash", &[]).unwrap();
+            let height: u64 = ctx.env.node.client.call("getblockcount", &[]).unwrap();
+
+            if height <= target_height {
+                break;
+            }
+
+            ctx.env.node.client.invalidate_block(tip).unwrap();
+        }
+
+        // final ddust tx1: batches up to 100 mempool txs
+        let psbt = cmd_spend(
+            &ctx.db,
+            ctx.network,
+            &ctx.rpc_client,
+            dust_sats,
+            addr_batcher1,
+        )
+        .unwrap();
+        let signed = ctx.env.wallet_process_psbt(&ctx.wallet1_name, &psbt);
+        // 101 = one self + 100 from mempool
+        broadcast_and_assert(&ctx, signed, 101, OpReturn::Ash);
+
+        // final ddust tx2: batches remaining 20 mempool txs plus ddust tx1
+        let psbt = cmd_spend(
+            &ctx.db,
+            ctx.network,
+            &ctx.rpc_client,
+            dust_sats,
+            addr_batcher2,
+        )
+        .unwrap();
+        let signed = ctx.env.wallet_process_psbt(&ctx.wallet1_name, &psbt);
+        broadcast_and_assert(&ctx, signed, 122, OpReturn::Ash);
     }
 }

@@ -131,12 +131,21 @@ impl TestEnv {
     }
 
     /// Create a `required`-of-N multisig address from the given wallets.
+    /// `address_type` controls the output script: Legacy -> P2SH, P2shSegwit -> P2SH-P2WSH,
+    /// Bech32 -> P2WSH. Bech32m (taproot) is not supported by createmultisig.
     /// Returns the multisig address and its descriptor.
     pub fn create_multisig(
         &self,
         wallet_names: &[&str],
         required: usize,
+        address_type: &AddressType,
     ) -> (Address, ExtendedDescriptor) {
+        let address_type_str = match address_type {
+            AddressType::Legacy => "legacy",
+            AddressType::P2shSegwit => "p2sh-segwit",
+            AddressType::Bech32 => "bech32",
+            AddressType::Bech32m => panic!("taproot multisig is not supported by createmultisig"),
+        };
         let pubkeys: Vec<PublicKey> = wallet_names
             .iter()
             .map(|name| {
@@ -151,21 +160,30 @@ impl TestEnv {
             })
             .collect();
 
-        let result = self
+        // call createmultisig directly so we can pass an explicit address_type.
+        let pubkey_hexes: Vec<String> = pubkeys.iter().map(|pk| pk.to_string()).collect();
+        let result: serde_json::Value = self
             .node
             .client
-            .create_multisig(required as u32, pubkeys)
+            .call(
+                "createmultisig",
+                &[
+                    json!(required),
+                    json!(pubkey_hexes),
+                    json!(address_type_str),
+                ],
+            )
             .unwrap();
 
+        let address = result["address"].as_str().unwrap();
+        let descriptor = result["descriptor"].as_str().unwrap();
+
         let secp = Secp256k1::new();
-        let desc = ExtendedDescriptor::parse_descriptor(&secp, &result.descriptor)
+        let desc = ExtendedDescriptor::parse_descriptor(&secp, descriptor)
             .map(|(d, _)| d)
             .unwrap();
 
-        (
-            Address::from_str(&result.address).unwrap().assume_checked(),
-            desc,
-        )
+        (Address::from_str(address).unwrap().assume_checked(), desc)
     }
 
     /// Process and sign a PSBT using the given wallet.
