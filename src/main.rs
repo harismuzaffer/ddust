@@ -1140,7 +1140,7 @@ mod tests {
         ctx
     }
 
-    /// 1. Empty OP_RETURN batch (Legacy + Bech32m)
+    /// OpReturn::Empty batch (Legacy + Bech32m)
     #[test]
     fn test_batch_legacy_bech32() {
         let ctx = setup_ctx();
@@ -1172,7 +1172,37 @@ mod tests {
         broadcast_and_assert(&ctx, signed.clone(), 2, OpReturn::Empty);
     }
 
-    /// 2. OpReturn:Ash OP_RETURN batch (Bech32m + Bech32m)
+    /// OpReturn::Ash batch (Bech32m + Legacy)
+    #[test]
+    fn test_batch_bech32_legacy() {
+        let ctx = setup_ctx();
+
+        // Case: Expect OpReturn::Ash
+        let addr1 = ctx.env.new_address(&ctx.wallet1_name, &AddressType::Bech32);
+        let amt1 = Amount::from_sat(555);
+        ctx.env.send_to_address(&addr1, amt1);
+        let addr2 = ctx.env.new_address(&ctx.wallet2_name, &AddressType::Legacy);
+        let min_sats = min_sats_for_batching(amt1, &[InputType::P2WPKH], InputType::P2PKH);
+        ctx.env.send_to_address(&addr2, min_sats);
+        ctx.env.mine_blocks(1);
+
+        // first tx
+        let dust_sats = Amount::from_sat(1000);
+        let psbt = cmd_spend(&ctx.db, ctx.network, &ctx.rpc_client, dust_sats, addr1).unwrap();
+        let signed = ctx.env.wallet_process_psbt(&ctx.wallet1_name, &psbt);
+        broadcast_and_assert(&ctx, signed, 1, OpReturn::Ash);
+
+        // spend addr2 and expect batch of the mempool ddust tx
+        let psbt_batched =
+            cmd_spend(&ctx.db, ctx.network, &ctx.rpc_client, dust_sats, addr2).unwrap();
+        let signed = ctx
+            .env
+            .wallet_process_psbt(&ctx.wallet2_name, &psbt_batched);
+        // the original tx output of OpReturn::Ash is preserved
+        broadcast_and_assert(&ctx, signed.clone(), 2, OpReturn::Ash);
+    }
+
+    /// OpReturn::Ash batch (Bech32m + Bech32m)
     #[test]
     fn test_batch_bech32_bech32() {
         let ctx = setup_ctx();
