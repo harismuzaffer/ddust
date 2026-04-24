@@ -149,7 +149,7 @@ impl TxSizeCalculator {
             Self::OVERHEAD + Self::input_base_size(&self.inputs[0]) + Self::OP_RETURN_EMPTY;
         let needs_ash = first_input_base_with_empty < Self::MIN_BASE_SIZE;
 
-        let output_bytes = if needs_ash {
+        let output_bytes = if needs_ash && self.inputs.len() == 1 {
             Self::OP_RETURN_ASH
         } else {
             Self::OP_RETURN_EMPTY
@@ -202,12 +202,23 @@ impl TxSizeCalculator {
     ) -> TxSizeBreakdown {
         let base_size = Self::OVERHEAD + input_base + output_bytes;
         let witness_overhead = if has_witness { Self::WITNESS_HEADER } else { 0 };
-        let total_size = base_size + witness_overhead + input_witness;
+
+        // segwit tx: each legacy input pays 1 byte for its empty witness-stack counter
+        let legacy_input_count = if has_witness {
+            self.inputs
+                .iter()
+                .filter(|i| Self::input_witness_size(i) == 0)
+                .count()
+        } else {
+            0
+        };
+
+        let total_size = base_size + witness_overhead + input_witness + legacy_input_count;
 
         // Weight calculation:
         // - Base data (non-witness) counts as 4 weight units per byte
         // - Witness data counts as 1 weight unit per byte
-        let weight = base_size * 4 + witness_overhead + input_witness;
+        let weight = base_size * 4 + witness_overhead + input_witness + legacy_input_count;
         let vsize = weight as f64 / 4.0;
 
         TxSizeBreakdown {
@@ -226,8 +237,8 @@ impl TxSizeCalculator {
     fn input_base_size(input_type: &InputType) -> usize {
         match input_type {
             // P2PKH: outpoint (36) + scriptSig length (1) + scriptSig (~107) + sequence (4)
-            // scriptSig: sig (~72) + pubkey (33) + push opcodes (2)
-            InputType::P2PKH => 148,
+            // scriptSig: sig (~71) + pubkey (33) + push opcodes (2)
+            InputType::P2PKH => 147,
 
             // P2WPKH: outpoint (36) + empty scriptSig (1) + sequence (4)
             InputType::P2WPKH => 41,
@@ -255,8 +266,8 @@ impl TxSizeCalculator {
             // P2PKH: no witness data
             InputType::P2PKH => 0,
 
-            // P2WPKH witness: item count (1) + sig length (1) + sig (~72) + pubkey length (1) + pubkey (33)
-            InputType::P2WPKH => 108,
+            // P2WPKH witness: item count (1) + sig length (1) + sig (~71) + pubkey length (1) + pubkey (33)
+            InputType::P2WPKH => 107,
 
             // P2TR witness (key-path): item count (1) + sig length (1) + schnorr sig (64) + sighash type (1)
             // Note: NONE|ANYONECANPAY requires explicit sighash byte
@@ -266,7 +277,7 @@ impl TxSizeCalculator {
                 // Bare P2SH multisig: no witness
                 P2SHInner::Multisig(_) => 0,
                 // P2SH-P2WPKH: same witness as P2WPKH
-                P2SHInner::P2WPKH => 108,
+                P2SHInner::P2WPKH => 107,
                 // P2SH-P2WSH: multisig witness
                 P2SHInner::P2WSH(cfg) => Self::p2wsh_witness_size(cfg),
             },
@@ -282,7 +293,7 @@ impl TxSizeCalculator {
         // sequence: 4 bytes
         // scriptSig contains:
         //   - OP_0 (CHECKMULTISIG bug workaround): 1 byte
-        //   - m signatures: m * (push opcode 1 + sig ~72) = m * 73
+        //   - m signatures: m * (push opcode 1 + sig ~72) = m * 72
         //   - redeemScript push: 1 byte (OP_PUSHDATA1) + 1 byte (length) for scripts > 75 bytes
         //   - redeemScript: OP_m (1) + n * (push 1 + pubkey 33) + OP_n (1) + OP_CHECKMULTISIG (1)
         //                 = 3 + n * 34
@@ -291,7 +302,7 @@ impl TxSizeCalculator {
         let redeem_script_push = if redeem_script_size > 75 { 2 } else { 1 };
 
         // scriptSig = OP_0 + m * (push + sig) + redeemScript push + redeemScript
-        let scriptsig_size = 1 + cfg.required * 73 + redeem_script_push + redeem_script_size;
+        let scriptsig_size = 1 + cfg.required * 72 + redeem_script_push + redeem_script_size;
         let scriptsig_len_varint = Self::varint_size(scriptsig_size);
 
         36 + scriptsig_len_varint + scriptsig_size + 4
@@ -302,7 +313,7 @@ impl TxSizeCalculator {
         // Witness stack:
         //   - item count: varint (1 byte for small counts)
         //   - OP_0 dummy for CHECKMULTISIG bug: length (1) + empty (0) = 1 byte
-        //   - m signatures: m * (length varint 1 + sig ~72) = m * 73
+        //   - m signatures: m * (length varint 1 + sig ~72) = m * 72
         //   - witness script: length varint + script
         //     script = OP_m (1) + n * (push 1 + pubkey 33) + OP_n (1) + OP_CHECKMULTISIG (1)
         //            = 3 + n * 34
@@ -311,7 +322,7 @@ impl TxSizeCalculator {
         let witness_script_len_varint = Self::varint_size(witness_script_size);
 
         // item count (1) + OP_0 dummy (1) + m signatures + witness script
-        1 + 1 + cfg.required * 73 + witness_script_len_varint + witness_script_size
+        1 + 1 + cfg.required * 72 + witness_script_len_varint + witness_script_size
     }
 
     /// Calculate VarInt size for a given value
@@ -341,16 +352,16 @@ mod tests {
             .calculate();
 
         // From BIP spec table: P2PKH single input
-        // Overhead: 10, Input: 148, OP_RETURN: 11 (empty)
-        // Base size: 169, Weight: 676, vSize: 169
+        // Overhead: 10, Input: 147, OP_RETURN: 11 (empty)
+        // Base size: 168, Weight: 672, vSize: 168
         assert_eq!(size.overhead_bytes, 10);
-        assert_eq!(size.input_base_bytes, 148);
+        assert_eq!(size.input_base_bytes, 147);
         assert_eq!(size.input_witness_bytes, 0);
         assert_eq!(size.output_bytes, 11); // empty OP_RETURN (no padding needed)
-        assert_eq!(size.base_size, 169);
-        assert_eq!(size.total_size, 169);
-        assert_eq!(size.weight, 676);
-        assert_eq!(size.vsize, 169.0);
+        assert_eq!(size.base_size, 168);
+        assert_eq!(size.total_size, 168);
+        assert_eq!(size.weight, 672);
+        assert_eq!(size.vsize, 168.0);
         assert!(size.meets_min_size());
     }
 
@@ -362,17 +373,17 @@ mod tests {
 
         // From BIP spec table: P2WPKH single input
         // Overhead: 10, Input base: 41, OP_RETURN: 14 (ash for padding)
-        // Base size: 65, Witness: 108, Total: 175, Weight: 370, vSize: 92.5
+        // Base size: 65, Witness: 107, Total: 174, Weight: 369, vSize: 92.25
         assert_eq!(size.overhead_bytes, 10);
         assert_eq!(size.input_base_bytes, 41);
-        assert_eq!(size.input_witness_bytes, 108);
+        assert_eq!(size.input_witness_bytes, 107);
         assert_eq!(size.output_bytes, 14); // "ash" OP_RETURN (needs padding)
         assert_eq!(size.base_size, 65);
-        // total = base + witness_header (2) + witness = 65 + 2 + 108 = 175
-        assert_eq!(size.total_size, 175);
-        // weight = base * 4 + witness_header + witness = 65*4 + 2 + 108 = 370
-        assert_eq!(size.weight, 370);
-        assert_eq!(size.vsize, 92.5);
+        // total = base + witness_header (2) + witness = 65 + 2 + 107 = 174
+        assert_eq!(size.total_size, 174);
+        // weight = base * 4 + witness_header + witness = 65*4 + 2 + 107 = 369
+        assert_eq!(size.weight, 369);
+        assert_eq!(size.vsize, 92.25);
         assert!(size.meets_min_size());
     }
 
@@ -410,9 +421,9 @@ mod tests {
 
         // 2-of-2 P2SH multisig:
         // redeemScript = OP_2 + 2*(push + pubkey) + OP_2 + OP_CHECKMULTISIG = 3 + 2*34 = 71 bytes
-        // scriptSig = OP_0 + 2*(push + sig) + push + redeemScript = 1 + 2*73 + 1 + 71 = 219
-        // input = 36 + 1 + 219 + 4 = 260
-        assert_eq!(size.input_base_bytes, 260);
+        // scriptSig = OP_0 + 2*(push + sig) + push + redeemScript = 1 + 2*72 + 1 + 71 = 217
+        // input = 36 + 1 + 217 + 4 = 258
+        assert_eq!(size.input_base_bytes, 258);
         assert_eq!(size.input_witness_bytes, 0);
         assert_eq!(size.output_bytes, 11); // empty (base size > 65)
         assert!(size.meets_min_size());
@@ -428,10 +439,10 @@ mod tests {
 
         // 2-of-3 P2SH multisig:
         // redeemScript = 3 + 3*34 = 105 bytes (> 75, needs OP_PUSHDATA1)
-        // scriptSig = OP_0 + 2*73 + 2 + 105 = 254 bytes
-        // scriptSig length varint = 3 bytes (since 254 >= 253)
-        // input = 36 + 3 + 254 + 4 = 297
-        assert_eq!(size.input_base_bytes, 297);
+        // scriptSig = OP_0 + 2*72 + 2 + 105 = 252 bytes
+        // scriptSig length varint = 1 bytes (since 252 < 253)
+        // input = 36 + 1 + 252 + 4 = 293
+        assert_eq!(size.input_base_bytes, 293);
         assert_eq!(size.input_witness_bytes, 0);
         assert!(size.meets_min_size());
     }
@@ -445,15 +456,15 @@ mod tests {
         // P2WSH 2-of-3:
         // input base: 41
         // witness script = 3 + 3*34 = 105 bytes
-        // witness = 1 (count) + 1 (OP_0) + 2*73 (sigs) + 1 (len) + 105 = 254
+        // witness = 1 (count) + 1 (OP_0) + 2*72 (sigs) + 1 (len) + 105 = 252
         assert_eq!(size.input_base_bytes, 41);
-        assert_eq!(size.input_witness_bytes, 254);
+        assert_eq!(size.input_witness_bytes, 252);
         assert_eq!(size.output_bytes, 14); // "ash" (single witness input)
         assert!(size.meets_min_size());
 
-        // weight = 65*4 + 2 + 254 = 516
-        assert_eq!(size.weight, 516);
-        assert_eq!(size.vsize, 129.0);
+        // weight = 65*4 + 2 + 252 = 514
+        assert_eq!(size.weight, 514);
+        assert_eq!(size.vsize, 128.5);
     }
 
     #[test]
@@ -464,15 +475,15 @@ mod tests {
 
         // P2SH-P2WPKH (nested SegWit):
         // input base: 64 (36 + 1 + 23 + 4)
-        // witness: 108 (same as P2WPKH)
+        // witness: 107 (same as P2WPKH)
         assert_eq!(size.input_base_bytes, 64);
-        assert_eq!(size.input_witness_bytes, 108);
+        assert_eq!(size.input_witness_bytes, 107);
         assert_eq!(size.output_bytes, 11); // empty (base = 10+64+11 = 85 >= 65)
         assert!(size.meets_min_size());
 
-        // weight = 85*4 + 2 + 108 = 450
-        assert_eq!(size.weight, 450);
-        assert_eq!(size.vsize, 112.5);
+        // weight = 85*4 + 2 + 107 = 449
+        assert_eq!(size.weight, 449);
+        assert_eq!(size.vsize, 112.25);
     }
 
     #[test]
@@ -483,9 +494,9 @@ mod tests {
 
         // P2SH-P2WSH 2-of-3:
         // input base: 76 (36 + 1 + 35 + 4)
-        // witness = 1 + 1 + 2*73 + 1 + 105 = 254
+        // witness = 1 + 1 + 2*72 + 1 + 105 = 252
         assert_eq!(size.input_base_bytes, 76);
-        assert_eq!(size.input_witness_bytes, 254);
+        assert_eq!(size.input_witness_bytes, 252);
         assert_eq!(size.output_bytes, 11); // empty (base = 10+76+11 = 97 >= 65)
         assert!(size.meets_min_size());
     }
@@ -512,7 +523,7 @@ mod tests {
             .add_input(InputType::P2TR)
             .calculate();
 
-        assert_eq!(size.input_base_bytes, 189); // 148 + 41
+        assert_eq!(size.input_base_bytes, 188); // 147 + 41
         assert_eq!(size.input_witness_bytes, 67); // 0 + 67
         assert_eq!(size.output_bytes, 11); // empty (multiple inputs)
     }
@@ -607,7 +618,7 @@ mod tests {
         let p2wpkh = TxSizeCalculator::new()
             .add_input(InputType::P2WPKH)
             .calculate();
-        assert!((p2wpkh.fee_rate(300) - 3.24).abs() < 0.01);
+        assert!((p2wpkh.fee_rate(300) - 3.25).abs() < 0.01);
 
         let p2tr = TxSizeCalculator::new()
             .add_input(InputType::P2TR)
@@ -623,17 +634,17 @@ mod tests {
         assert_eq!(TxSizeCalculator::single_input_vsize(InputType::P2TR), 57.75);
         assert_eq!(
             TxSizeCalculator::single_input_vsize(InputType::P2WPKH),
-            68.0
+            67.75
         );
         assert_eq!(
             TxSizeCalculator::single_input_vsize(InputType::P2PKH),
-            148.0
+            147.0
         );
 
-        // P2WSH 2-of-3: (41*4 + 254) / 4 = 104.5
+        // P2WSH 2-of-3: (41*4 + 252) / 4 = 104.0
         let p2wsh_vsize =
             TxSizeCalculator::single_input_vsize(InputType::P2WSH(MultisigConfig::new(2, 3)));
-        assert_eq!(p2wsh_vsize, 104.5);
+        assert_eq!(p2wsh_vsize, 104.0);
     }
 
     #[test]
@@ -644,8 +655,8 @@ mod tests {
 
         // Combined input vsize
         let vsize = calc.input_vsize();
-        // P2PKH: 148, P2TR: 57.75, total: 205.75
-        assert_eq!(vsize, 205.75);
+        // P2PKH: 147, P2TR: 57.75, total: 204.75
+        assert_eq!(vsize, 204.75);
     }
 
     // ==================== BIP Spec Table Verification ====================
@@ -658,17 +669,17 @@ mod tests {
         let p2pkh = TxSizeCalculator::new()
             .add_input(InputType::P2PKH)
             .calculate();
-        assert_eq!(p2pkh.base_size, 169);
-        assert_eq!(p2pkh.weight, 676);
-        assert_eq!(p2pkh.vsize, 169.0);
+        assert_eq!(p2pkh.base_size, 168);
+        assert_eq!(p2pkh.weight, 672);
+        assert_eq!(p2pkh.vsize, 168.0);
 
         // P2WPKH
         let p2wpkh = TxSizeCalculator::new()
             .add_input(InputType::P2WPKH)
             .calculate();
         assert_eq!(p2wpkh.base_size, 65);
-        assert_eq!(p2wpkh.weight, 370);
-        assert_eq!(p2wpkh.vsize, 92.5);
+        assert_eq!(p2wpkh.weight, 369);
+        assert_eq!(p2wpkh.vsize, 92.25);
 
         // P2TR
         let p2tr = TxSizeCalculator::new()
@@ -727,7 +738,7 @@ mod tests {
             .add_input(InputType::P2PKH)
             .calculate();
 
-        assert_eq!(first_tx.vsize, 169.0); // 10.5 rounded to 10 for overhead
+        assert_eq!(first_tx.vsize, 168.0); // 10.5 rounded to 10 for overhead
 
         // For batching, we need to calculate the combined size
         let batched = TxSizeCalculator::new()

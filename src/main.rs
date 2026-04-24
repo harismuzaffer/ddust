@@ -612,8 +612,9 @@ fn is_ddust_tx(tx: &Transaction, want_script: &Option<Vec<u8>>) -> bool {
                         return false;
                     }
                 }
-                // ECDSA (P2WPKH/P2WSH)
-                71..=73 => {
+                // ECDSA (P2WPKH/P2WSH) — low-R/low-S sigs (with sighash byte) are typically
+                // 71 B, but can be 70 when s has a leading 0x00, or 72 in non-grinded paths.
+                70..=73 => {
                     if *sig.last().unwrap() != EcdsaSighashType::AllPlusAnyoneCanPay as u8 {
                         return false;
                     }
@@ -638,6 +639,9 @@ fn is_ddust_tx(tx: &Transaction, want_script: &Option<Vec<u8>>) -> bool {
 }
 
 fn get_input_vsize(input: &TxIn) -> f64 {
+    if input.witness.is_empty() {
+        return input.base_size() as f64;
+    }
     let weight = input.base_size() * 3 + input.total_size();
     weight as f64 / 4.0
 }
@@ -646,18 +650,18 @@ fn estimate_input_vsize(script_pubkey: &ScriptBuf) -> f64 {
     if script_pubkey.is_p2tr() {
         57.75
     } else if script_pubkey.is_p2wpkh() {
-        68.0
+        67.75
     } else if script_pubkey.is_p2wsh() {
         // 2-of-3 multisig estimate
-        105.0
+        104.0
     } else if script_pubkey.is_p2pkh() {
-        148.0
+        147.0
     } else if script_pubkey.is_p2sh() {
         // Could be P2SH-P2WPKH (~364 WU)
         // Could be P2SH-P2WSH (~478 WU for 2-of-3)
-        // Could be bare P2SH multisig (~1188 WU for 2-of-3)
+        // Could be bare P2SH multisig (~1172 WU for 2-of-3)
         // Can't tell from scriptPubKey alone, use worst case
-        297.0
+        293.0
     } else {
         panic!("Unsupported input encountered");
     }
@@ -693,8 +697,21 @@ fn find_batchable_txs(
     let mut batchable: Vec<Transaction> = vec![];
 
     // replacement tx vsize
-    // overhead
-    let mut tx_vsize = 10.5;
+    // segwit-tx serialization adds two costs over a pure-legacy tx:
+    //   - 0.5 vb for the per-tx marker+flag (2 bytes, once)
+    //   - 0.25 vb per legacy (empty-witness)
+    // Both apply only if the replacement is segwit (any input has a witness).
+    let mut has_segwit = dust_utxos
+        .iter()
+        .any(|u| u.txout.script_pubkey.is_witness_program());
+    let mut legacy_input_count = dust_utxos
+        .iter()
+        .filter(|u| !u.txout.script_pubkey.is_witness_program())
+        .count();
+    let mut tx_vsize = 10.0;
+    if has_segwit {
+        tx_vsize += 0.5 + 0.25 * legacy_input_count as f64;
+    }
     tx_vsize += dust_utxos
         .iter()
         .map(|utxo| estimate_input_vsize(&utxo.txout.script_pubkey))
@@ -710,8 +727,8 @@ fn find_batchable_txs(
     let tx_input_amount: Amount = dust_utxos.iter().map(|out| out.txout.value).sum();
     let dust_amount_sats = tx_input_amount.to_sat() as f64;
 
-    // collect fee, rate and input vsize for each unconfirmed tx
-    let mut tx_info: Vec<(Transaction, Amount, f64, f64)> = unconfirmed_txs
+    // collect fee, rate, input vsize, segwit-presence and legacy-input count per unconfirmed tx
+    let mut tx_info: Vec<(Transaction, Amount, f64, f64, bool, usize)> = unconfirmed_txs
         .iter()
         .map(|tx| {
             let entry = rpc_client.get_mempool_entry(&tx.compute_txid()).unwrap();
@@ -719,7 +736,16 @@ fn find_batchable_txs(
             let vsize = entry.vsize as f64;
             let rate = fee.to_sat() as f64 / vsize;
             let input_vsize: f64 = tx.input.iter().map(get_input_vsize).sum();
-            (tx.clone(), fee, rate, input_vsize)
+            let tx_has_segwit = tx.input.iter().any(|i| !i.witness.is_empty());
+            let tx_legacy_count = tx.input.iter().filter(|i| i.witness.is_empty()).count();
+            (
+                tx.clone(),
+                fee,
+                rate,
+                input_vsize,
+                tx_has_segwit,
+                tx_legacy_count,
+            )
         })
         .collect();
 
@@ -733,17 +759,28 @@ fn find_batchable_txs(
     let mut combined_vsize: f64 = tx_vsize;
     let mut combined_amount: Amount = tx_input_amount;
 
-    for (tx, fee, rate, input_vsize) in tx_info {
+    for (tx, fee, rate, input_vsize, tx_has_segwit, tx_legacy_count) in tx_info {
         if batchable.len() >= MAX_REPLACED {
             debug!("batchable: hit eviction cap of {} txs", MAX_REPLACED);
             break;
         }
+        // segwit serialization tax: 0.5 vb (marker+flag, once) + 0.25 vb per legacy input
+        let now_segwit = has_segwit || tx_has_segwit;
+        let mut overhead_bump = 0.0;
+        if !has_segwit && now_segwit {
+            // segwit just turned on: pay marker+flag and 0.25 per already-counted legacy input
+            overhead_bump += 0.5 + 0.25 * legacy_input_count as f64;
+        }
+        if now_segwit {
+            // each new legacy input from this tx pays the empty-witness-counter cost
+            overhead_bump += 0.25 * tx_legacy_count as f64;
+        }
         let new_amount = combined_amount + fee;
-        let new_vsize = combined_vsize + input_vsize;
-        let new_rate = new_amount.to_sat() as f64 / new_vsize;
+        let new_vsize = combined_vsize + input_vsize + overhead_bump;
+        let new_rate = new_amount.to_sat() as f64 / new_vsize.ceil();
 
         // additional fee (dust_amount_sats) must cover incremental relay over new vsize.
-        let bandwidth_ok = dust_amount_sats >= 0.1 * new_vsize;
+        let bandwidth_ok = dust_amount_sats >= 0.1 * new_vsize.ceil();
         // replacement rate must exceed every replaced tx's rate.
         let rate_ok = new_rate > rate;
 
@@ -754,6 +791,10 @@ fn find_batchable_txs(
             );
             combined_amount = new_amount;
             combined_vsize = new_vsize;
+            legacy_input_count += tx_legacy_count;
+            if tx_has_segwit {
+                has_segwit = true;
+            }
             batchable.push(tx);
         } else {
             // sorted ascending by rate, so subsequent txs have rate >= this one (rate check
@@ -1183,7 +1224,7 @@ mod tests {
         ctx.env.send_to_address(&addr1, amt1);
         let addr2 = ctx.env.new_address(&ctx.wallet2_name, &AddressType::Legacy);
         let min_sats = min_sats_for_batching(amt1, &[InputType::P2WPKH], InputType::P2PKH);
-        ctx.env.send_to_address(&addr2, min_sats);
+        ctx.env.send_to_address(&addr2, min_sats + Amount::ONE_SAT);
         ctx.env.mine_blocks(1);
 
         // first tx

@@ -240,23 +240,25 @@ All valid dust disposal transactions should be verified to be accepted into the 
 
 |                   | P2PKH | P2SH (2-3) | P2WPKH | P2WSH (2-3) | P2TR  |
 |-------------------|-------|------------|--------|-------------|-------|
-| Overhead (b)      | 10    | 10         | 10     | 10          | 10    | 
-| Input (b)         | 148   | 295        | 41     | 41          | 41    |
+| Overhead (b)      | 10    | 10         | 10     | 10          | 10    |
+| Input (b)         | 147   | 293        | 41     | 41          | 41    |
 | OP_RETURN (b)     | 11    | 11         | 14     | 14          | 14    |
-| Base size (b)     | 169   | 316        | 65     | 65          | 65    |
-| Witness data (b)  | 0     | 0          | 108    | 255         | 67    |
-| Size (b)          | 169   | 316        | 173    | 320         | 132   |
-| Weight (wu)       | 676   | 1264       | 370    | 517         | 329   |
-| Virtual Size (vb) | 169   | 316        | 92.5   | 129.25      | 82.25 | 
+| Base size (b)     | 168   | 314        | 65     | 65          | 65    |
+| Witness data (b)  | 0     | 0          | 107    | 252         | 67    |
+| Size (b)          | 168   | 314        | 172    | 317         | 132   |
+| Weight (wu)       | 672   | 1256       | 369    | 514         | 329   |
+| Virtual Size (vb) | 168   | 314        | 92.25  | 128.5       | 82.25 |
+
+ECDSA-signed inputs assume low-R signature grinding (71-byte signatures including the sighash byte)
 
 #### Example dust disposal transaction fee rates (sats/vb)
 
 | Input Amount | P2PKH   | P2SH (2-3) | P2WPKH | P2WSH (2-3) | P2TR  |
 |--------------|---------|------------|--------|-------------|-------|
-| 294          | 1.74    | 0.93       | 3.18   | 2.27        | 3.57  |
-| 300          | 1.78    | 0.95       | 3.24   | 2.32        | 3.65  |
-| 325          | 1.92    | 1.03       | 3.51   | 2.51        | 3.95  |
-| 330          | 1.95    | 1.04       | 3.57   | 2.55        | 4.01  |
+| 294          | 1.75    | 0.94       | 3.19   | 2.29        | 3.57  |
+| 300          | 1.79    | 0.96       | 3.25   | 2.33        | 3.65  |
+| 325          | 1.93    | 1.04       | 3.52   | 2.53        | 3.95  |
+| 330          | 1.96    | 1.05       | 3.58   | 2.57        | 4.01  |
 
 ### Batching dust disposal txs via RBF
 
