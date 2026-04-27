@@ -672,6 +672,31 @@ fn is_dust(out: &LocalOutput, dust_amount: &Amount) -> bool {
     !out.is_spent && out.txout.value <= *dust_amount && out.chain_position.is_confirmed()
 }
 
+struct CandidateTx {
+    tx: Transaction,
+    fee: Amount,
+    rate: f64,
+    input_vsize: f64,
+    has_segwit: bool,
+    legacy_count: usize,
+}
+
+impl CandidateTx {
+    fn new(tx: &Transaction, rpc_client: &Client) -> Self {
+        let entry = rpc_client.get_mempool_entry(&tx.compute_txid()).unwrap();
+        let fee = entry.fees.base;
+        let rate = fee.to_sat() as f64 / entry.vsize as f64;
+        Self {
+            tx: tx.clone(),
+            fee,
+            rate,
+            input_vsize: tx.input.iter().map(get_input_vsize).sum(),
+            has_segwit: tx.input.iter().any(|i| !i.witness.is_empty()),
+            legacy_count: tx.input.iter().filter(|i| i.witness.is_empty()).count(),
+        }
+    }
+}
+
 /// Selects unconfirmed ddust transactions that can be batched into a single RBF-compliant replacement.
 /// `dust_utxos` are extra inputs added by the batcher.
 ///
@@ -694,117 +719,90 @@ fn find_batchable_txs(
     }
     let output_script = &unconfirmed_txs[0].output[0].script_pubkey;
 
-    let mut batchable: Vec<Transaction> = vec![];
-
-    // replacement tx vsize
-    // segwit-tx serialization adds two costs over a pure-legacy tx:
-    //   - 0.5 vb for the per-tx marker+flag (2 bytes, once)
-    //   - 0.25 vb per legacy (empty-witness)
-    // Both apply only if the replacement is segwit (any input has a witness).
+    // Initial replacement state from the batcher's own dust inputs. If any input is segwit,
+    // the tx pays a 0.5 vb marker+flag (once) plus 0.25 vb per legacy input.
     let mut has_segwit = dust_utxos
         .iter()
         .any(|u| u.txout.script_pubkey.is_witness_program());
-    let mut legacy_input_count = dust_utxos
+    let mut legacy_count = dust_utxos
         .iter()
         .filter(|u| !u.txout.script_pubkey.is_witness_program())
         .count();
-    let mut tx_vsize = 10.0;
-    if has_segwit {
-        tx_vsize += 0.5 + 0.25 * legacy_input_count as f64;
-    }
-    tx_vsize += dust_utxos
-        .iter()
-        .map(|utxo| estimate_input_vsize(&utxo.txout.script_pubkey))
-        .sum::<f64>();
-
-    tx_vsize += match output_script.as_bytes() {
-        // empty OP_RETURN no data, size = 11
-        [0x6a, 0x00] => 11.0,
-        // contains 3 bytes 'ash', size = 14
-        _ => 14.0,
+    let output_vsize = match output_script.as_bytes() {
+        [0x6a, 0x00] => 11.0, // empty OP_RETURN
+        _ => 14.0,            // "ash" OP_RETURN
     };
-
-    let tx_input_amount: Amount = dust_utxos.iter().map(|out| out.txout.value).sum();
-    let dust_amount_sats = tx_input_amount.to_sat() as f64;
-
-    // collect fee, rate, input vsize, segwit-presence and legacy-input count per unconfirmed tx
-    let mut tx_info: Vec<(Transaction, Amount, f64, f64, bool, usize)> = unconfirmed_txs
+    let dust_input_vsize: f64 = dust_utxos
         .iter()
-        .map(|tx| {
-            let entry = rpc_client.get_mempool_entry(&tx.compute_txid()).unwrap();
-            let fee = entry.fees.base;
-            let vsize = entry.vsize as f64;
-            let rate = fee.to_sat() as f64 / vsize;
-            let input_vsize: f64 = tx.input.iter().map(get_input_vsize).sum();
-            let tx_has_segwit = tx.input.iter().any(|i| !i.witness.is_empty());
-            let tx_legacy_count = tx.input.iter().filter(|i| i.witness.is_empty()).count();
-            (
-                tx.clone(),
-                fee,
-                rate,
-                input_vsize,
-                tx_has_segwit,
-                tx_legacy_count,
-            )
-        })
+        .map(|u| estimate_input_vsize(&u.txout.script_pubkey))
+        .sum();
+    let segwit_vbytes = if has_segwit {
+        0.5 + 0.25 * legacy_count as f64
+    } else {
+        0.0
+    };
+    let mut combined_vsize = 10.0 + dust_input_vsize + output_vsize + segwit_vbytes;
+
+    let dust_amount: Amount = dust_utxos.iter().map(|u| u.txout.value).sum();
+    let dust_sats = dust_amount.to_sat() as f64;
+    let mut combined_amount = dust_amount;
+
+    // Sort ascending by fee rate: each iteration's rate check against `c.rate` covers all
+    // already-accepted txs, since their rates are <= the current one.
+    let mut candidates: Vec<CandidateTx> = unconfirmed_txs
+        .iter()
+        .map(|tx| CandidateTx::new(tx, rpc_client))
         .collect();
+    candidates.sort_by(|a, b| a.rate.partial_cmp(&b.rate).unwrap());
 
-    // sort ascending by fee rate so the rate check against the current iteration's rate
-    // covers all previously accepted txs (their rates are <= current).
-    tx_info.sort_by(|a, b| a.2.partial_cmp(&b.2).unwrap());
-
-    // mempool eviction cap
+    // BIP125 caps replaced txs at 100.
     const MAX_REPLACED: usize = 100;
 
-    let mut combined_vsize: f64 = tx_vsize;
-    let mut combined_amount: Amount = tx_input_amount;
-
-    for (tx, fee, rate, input_vsize, tx_has_segwit, tx_legacy_count) in tx_info {
+    let mut batchable: Vec<Transaction> = vec![];
+    for c in candidates {
         if batchable.len() >= MAX_REPLACED {
             debug!("batchable: hit eviction cap of {} txs", MAX_REPLACED);
             break;
         }
-        // segwit serialization tax: 0.5 vb (marker+flag, once) + 0.25 vb per legacy input
-        let now_segwit = has_segwit || tx_has_segwit;
-        let mut overhead_bump = 0.0;
+
+        // Is the replacement a segwit tx after adding c?
+        let now_segwit = has_segwit || c.has_segwit;
+        let mut bump = 0.0;
+        // Just turned segwit: pay marker+flag once + 0.25 vb on each prior legacy input.
         if !has_segwit && now_segwit {
-            // segwit just turned on: pay marker+flag and 0.25 per already-counted legacy input
-            overhead_bump += 0.5 + 0.25 * legacy_input_count as f64;
+            bump += 0.5 + 0.25 * legacy_count as f64;
         }
+        // Segwit tx: each legacy input in c pays 0.25 vb for its empty witness counter.
         if now_segwit {
-            // each new legacy input from this tx pays the empty-witness-counter cost
-            overhead_bump += 0.25 * tx_legacy_count as f64;
+            bump += 0.25 * c.legacy_count as f64;
         }
-        let new_amount = combined_amount + fee;
-        let new_vsize = combined_vsize + input_vsize + overhead_bump;
+
+        let new_amount = combined_amount + c.fee;
+        let new_vsize = combined_vsize + c.input_vsize + bump;
         let new_rate = new_amount.to_sat() as f64 / new_vsize.ceil();
 
-        // additional fee (dust_amount_sats) must cover incremental relay over new vsize.
-        let bandwidth_ok = dust_amount_sats >= 0.1 * new_vsize.ceil();
-        // replacement rate must exceed every replaced tx's rate.
-        let rate_ok = new_rate > rate;
-
-        if bandwidth_ok && rate_ok {
-            debug!(
-                "batchable: adding tx (rate {:.3}, combined rate {:.3}, combined vsize {:.1})",
-                rate, new_rate, new_vsize
-            );
-            combined_amount = new_amount;
-            combined_vsize = new_vsize;
-            legacy_input_count += tx_legacy_count;
-            if tx_has_segwit {
-                has_segwit = true;
-            }
-            batchable.push(tx);
-        } else {
-            // sorted ascending by rate, so subsequent txs have rate >= this one (rate check
-            // gets harder) and add at least some vsize (bandwidth check gets harder).
+        // Replacement must (1) pay for its own bandwidth (0.1 sat/vB incremental relay)
+        // and (2) exceed every replaced tx's fee rate.
+        let bandwidth_ok = dust_sats >= 0.1 * new_vsize.ceil();
+        let rate_ok = new_rate > c.rate;
+        if !(bandwidth_ok && rate_ok) {
+            // Sorted ascending by rate, so subsequent txs only make both checks harder.
             debug!(
                 "batchable: stopping at rate {:.3} (bandwidth_ok={}, rate_ok={}, combined rate {:.3}, combined vsize {:.1})",
-                rate, bandwidth_ok, rate_ok, new_rate, new_vsize
+                c.rate, bandwidth_ok, rate_ok, new_rate, new_vsize
             );
             break;
         }
+
+        debug!(
+            "batchable: adding tx (rate {:.3}, combined rate {:.3}, combined vsize {:.1})",
+            c.rate, new_rate, new_vsize
+        );
+        combined_amount = new_amount;
+        combined_vsize = new_vsize;
+        legacy_count += c.legacy_count;
+        has_segwit = now_segwit;
+        batchable.push(c.tx);
     }
 
     batchable
