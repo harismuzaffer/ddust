@@ -145,11 +145,11 @@ impl TxSizeCalculator {
 
         // Check if we need "ash" padding to meet minimum size
         // Only single witness inputs need padding
-        let first_input_base_with_empty =
-            Self::OVERHEAD + Self::input_base_size(&self.inputs[0]) + Self::OP_RETURN_EMPTY;
-        let needs_ash = first_input_base_with_empty < Self::MIN_BASE_SIZE;
+        let base_with_empty = Self::OVERHEAD + input_base + Self::OP_RETURN_EMPTY;
+        let needs_ash =
+            self.inputs.len() == 1 && has_witness && base_with_empty < Self::MIN_BASE_SIZE;
 
-        let output_bytes = if needs_ash && self.inputs.len() == 1 {
+        let output_bytes = if needs_ash {
             Self::OP_RETURN_ASH
         } else {
             Self::OP_RETURN_EMPTY
@@ -504,16 +504,26 @@ mod tests {
     // ==================== Multiple Input Tests ====================
 
     #[test]
-    fn test_multiple_p2tr_inputs_preserves_ash() {
+    fn test_multiple_p2tr_inputs_use_empty() {
         let size = TxSizeCalculator::new()
             .add_input(InputType::P2TR)
             .add_input(InputType::P2TR)
             .calculate();
 
         // Multiple inputs always use empty OP_RETURN
-        assert_eq!(size.output_bytes, 14);
+        assert_eq!(size.output_bytes, 11);
         assert_eq!(size.input_base_bytes, 82); // 41 * 2
         assert_eq!(size.input_witness_bytes, 134); // 67 * 2
+    }
+
+    #[test]
+    fn test_calculate_with_op_return_preserves_ash_for_multi_input() {
+        let size = TxSizeCalculator::new()
+            .add_input(InputType::P2TR)
+            .add_input(InputType::P2TR)
+            .calculate_with_op_return(true);
+
+        assert_eq!(size.output_bytes, 14);
     }
 
     #[test]
