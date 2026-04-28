@@ -240,18 +240,18 @@ All valid dust disposal transactions should be verified to be accepted into the 
 
 |                   | P2PKH | P2SH (2-3) | P2WPKH | P2WSH (2-3) | P2TR  |
 |-------------------|-------|------------|--------|-------------|-------|
-| Overhead (b)      | 10    | 10         | 10     | 10          | 10    |
-| Input (b)         | 147   | 293        | 41     | 41          | 41    |
-| OP_RETURN (b)     | 11    | 11         | 14     | 14          | 14    |
-| Base size (b)     | 168   | 314        | 65     | 65          | 65    |
-| Witness data (b)  | 0     | 0          | 107    | 252         | 67    |
-| Size (b)          | 168   | 314        | 172    | 317         | 132   |
+| Overhead (B)      | 10    | 10         | 10     | 10          | 10    |
+| Input (B)         | 147   | 293        | 41     | 41          | 41    |
+| OP_RETURN (B)     | 11    | 11         | 14     | 14          | 14    |
+| Base size (B)     | 168   | 314        | 65     | 65          | 65    |
+| Witness data (B)  | 0     | 0          | 107    | 252         | 67    |
+| Size (B)          | 168   | 314        | 172    | 317         | 132   |
 | Weight (wu)       | 672   | 1256       | 369    | 514         | 329   |
-| Virtual Size (vb) | 168   | 314        | 92.25  | 128.5       | 82.25 |
+| Virtual Size (vB) | 168   | 314        | 92.25  | 128.5       | 82.25 |
 
 ECDSA-signed inputs assume low-R signature grinding (71-byte signatures including the sighash byte)
 
-#### Example dust disposal transaction fee rates (sats/vb)
+#### Example dust disposal transaction fee rates (sats/vB)
 
 | Input Amount | P2PKH   | P2SH (2-3) | P2WPKH | P2WSH (2-3) | P2TR  |
 |--------------|---------|------------|--------|-------------|-------|
