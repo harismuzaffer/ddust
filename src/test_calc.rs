@@ -105,14 +105,8 @@ impl TxSizeCalculator {
     /// Witness marker and flag bytes (only present in witness transactions)
     const WITNESS_HEADER: usize = 2;
 
-    /// Empty OP_RETURN output size: amount (8) + script len (1) + OP_RETURN OP_0 (2)
-    const OP_RETURN_EMPTY: usize = 11;
-
     /// "ash" OP_RETURN output size: amount (8) + script len (1) + OP_RETURN OP_PUSHBYTES_3 "ash" (5)
     const OP_RETURN_ASH: usize = 14;
-
-    /// Minimum base transaction size required by Bitcoin Core
-    const MIN_BASE_SIZE: usize = 65;
 
     /// Create a new calculator for a dust disposal transaction
     pub fn new() -> Self {
@@ -134,72 +128,15 @@ impl TxSizeCalculator {
     }
 
     /// Calculate the final transaction size breakdown.
-    /// Automatically determines whether to use empty or "ash" OP_RETURN
-    /// based on minimum transaction size requirements.
+    /// Uses OP_RETURN "ash" output for all transactions.
     pub fn calculate(&self) -> TxSizeBreakdown {
         assert!(!self.inputs.is_empty(), "must have at least one input");
 
         let input_base: usize = self.inputs.iter().map(Self::input_base_size).sum();
         let input_witness: usize = self.inputs.iter().map(Self::input_witness_size).sum();
         let has_witness = input_witness > 0;
+        let output_bytes = Self::OP_RETURN_ASH;
 
-        // Check if we need "ash" padding to meet minimum size
-        // Only single witness inputs need padding
-        let base_with_empty = Self::OVERHEAD + input_base + Self::OP_RETURN_EMPTY;
-        let needs_ash =
-            self.inputs.len() == 1 && has_witness && base_with_empty < Self::MIN_BASE_SIZE;
-
-        let output_bytes = if needs_ash {
-            Self::OP_RETURN_ASH
-        } else {
-            Self::OP_RETURN_EMPTY
-        };
-
-        self.build_breakdown(input_base, input_witness, output_bytes, has_witness)
-    }
-
-    /// Calculate with a specific OP_RETURN type (for testing edge cases)
-    pub fn calculate_with_op_return(&self, use_ash: bool) -> TxSizeBreakdown {
-        assert!(!self.inputs.is_empty(), "must have at least one input");
-
-        let input_base: usize = self.inputs.iter().map(Self::input_base_size).sum();
-        let input_witness: usize = self.inputs.iter().map(Self::input_witness_size).sum();
-        let has_witness = input_witness > 0;
-
-        let output_bytes = if use_ash {
-            Self::OP_RETURN_ASH
-        } else {
-            Self::OP_RETURN_EMPTY
-        };
-
-        self.build_breakdown(input_base, input_witness, output_bytes, has_witness)
-    }
-
-    /// Get the vsize contribution of just the inputs (useful for batching calculations)
-    pub fn input_vsize(&self) -> f64 {
-        let input_base: usize = self.inputs.iter().map(Self::input_base_size).sum();
-        let input_witness: usize = self.inputs.iter().map(Self::input_witness_size).sum();
-
-        // Input weight = base * 4 + witness
-        let input_weight = input_base * 4 + input_witness;
-        input_weight as f64 / 4.0
-    }
-
-    /// Get vsize for a single input type
-    pub fn single_input_vsize(input_type: InputType) -> f64 {
-        let base = Self::input_base_size(&input_type);
-        let witness = Self::input_witness_size(&input_type);
-        let weight = base * 4 + witness;
-        weight as f64 / 4.0
-    }
-
-    fn build_breakdown(
-        &self,
-        input_base: usize,
-        input_witness: usize,
-        output_bytes: usize,
-        has_witness: bool,
-    ) -> TxSizeBreakdown {
         let base_size = Self::OVERHEAD + input_base + output_bytes;
         let witness_overhead = if has_witness { Self::WITNESS_HEADER } else { 0 };
 
@@ -231,6 +168,24 @@ impl TxSizeCalculator {
             weight,
             vsize,
         }
+    }
+
+    /// Get the vsize contribution of just the inputs (useful for batching calculations)
+    pub fn input_vsize(&self) -> f64 {
+        let input_base: usize = self.inputs.iter().map(Self::input_base_size).sum();
+        let input_witness: usize = self.inputs.iter().map(Self::input_witness_size).sum();
+
+        // Input weight = base * 4 + witness
+        let input_weight = input_base * 4 + input_witness;
+        input_weight as f64 / 4.0
+    }
+
+    /// Get vsize for a single input type
+    pub fn single_input_vsize(input_type: InputType) -> f64 {
+        let base = Self::input_base_size(&input_type);
+        let witness = Self::input_witness_size(&input_type);
+        let weight = base * 4 + witness;
+        weight as f64 / 4.0
     }
 
     /// Calculate input base size (non-witness portion)
@@ -352,16 +307,16 @@ mod tests {
             .calculate();
 
         // From BIP spec table: P2PKH single input
-        // Overhead: 10, Input: 147, OP_RETURN: 11 (empty)
-        // Base size: 168, Weight: 672, vSize: 168
+        // Overhead: 10, Input: 147, OP_RETURN: 14 ("ash")
+        // Base size: 171, Weight: 684, vSize: 171
         assert_eq!(size.overhead_bytes, 10);
         assert_eq!(size.input_base_bytes, 147);
         assert_eq!(size.input_witness_bytes, 0);
-        assert_eq!(size.output_bytes, 11); // empty OP_RETURN (no padding needed)
-        assert_eq!(size.base_size, 168);
-        assert_eq!(size.total_size, 168);
-        assert_eq!(size.weight, 672);
-        assert_eq!(size.vsize, 168.0);
+        assert_eq!(size.output_bytes, 14); // OP_RETURN "ash"
+        assert_eq!(size.base_size, 171);
+        assert_eq!(size.total_size, 171);
+        assert_eq!(size.weight, 684);
+        assert_eq!(size.vsize, 171.0);
         assert!(size.meets_min_size());
     }
 
@@ -372,12 +327,12 @@ mod tests {
             .calculate();
 
         // From BIP spec table: P2WPKH single input
-        // Overhead: 10, Input base: 41, OP_RETURN: 14 (ash for padding)
+        // Overhead: 10, Input base: 41, OP_RETURN: 14 ("ash")
         // Base size: 65, Witness: 107, Total: 174, Weight: 369, vSize: 92.25
         assert_eq!(size.overhead_bytes, 10);
         assert_eq!(size.input_base_bytes, 41);
         assert_eq!(size.input_witness_bytes, 107);
-        assert_eq!(size.output_bytes, 14); // "ash" OP_RETURN (needs padding)
+        assert_eq!(size.output_bytes, 14); // "ash" OP_RETURN
         assert_eq!(size.base_size, 65);
         // total = base + witness_header (2) + witness = 65 + 2 + 107 = 174
         assert_eq!(size.total_size, 174);
@@ -394,12 +349,12 @@ mod tests {
             .calculate();
 
         // From BIP spec table: P2TR single input
-        // Overhead: 10, Input base: 41, OP_RETURN: 14 (ash for padding)
+        // Overhead: 10, Input base: 41, OP_RETURN: 14 ("ash")
         // Base size: 65, Witness: 67, Weight: 329, vSize: 82.25
         assert_eq!(size.overhead_bytes, 10);
         assert_eq!(size.input_base_bytes, 41);
         assert_eq!(size.input_witness_bytes, 67);
-        assert_eq!(size.output_bytes, 14); // "ash" OP_RETURN (needs padding)
+        assert_eq!(size.output_bytes, 14); // "ash" OP_RETURN
         assert_eq!(size.base_size, 65);
         // total = 65 + 2 + 67 = 134
         assert_eq!(size.total_size, 134);
@@ -425,7 +380,7 @@ mod tests {
         // input = 36 + 1 + 217 + 4 = 258
         assert_eq!(size.input_base_bytes, 258);
         assert_eq!(size.input_witness_bytes, 0);
-        assert_eq!(size.output_bytes, 11); // empty (base size > 65)
+        assert_eq!(size.output_bytes, 14); // OP_RETURN "ash"
         assert!(size.meets_min_size());
     }
 
@@ -459,7 +414,7 @@ mod tests {
         // witness = 1 (count) + 1 (OP_0) + 2*72 (sigs) + 1 (len) + 105 = 252
         assert_eq!(size.input_base_bytes, 41);
         assert_eq!(size.input_witness_bytes, 252);
-        assert_eq!(size.output_bytes, 14); // "ash" (single witness input)
+        assert_eq!(size.output_bytes, 14); // "ash" OP_RETURN
         assert!(size.meets_min_size());
 
         // weight = 65*4 + 2 + 252 = 514
@@ -478,12 +433,12 @@ mod tests {
         // witness: 107 (same as P2WPKH)
         assert_eq!(size.input_base_bytes, 64);
         assert_eq!(size.input_witness_bytes, 107);
-        assert_eq!(size.output_bytes, 11); // empty (base = 10+64+11 = 85 >= 65)
+        assert_eq!(size.output_bytes, 14); // OP_RETURN "ash"
         assert!(size.meets_min_size());
 
-        // weight = 85*4 + 2 + 107 = 449
-        assert_eq!(size.weight, 449);
-        assert_eq!(size.vsize, 112.25);
+        // weight = 88*4 + 2 + 107 = 461 (base includes 10 + 64 + 14 = 88)
+        assert_eq!(size.weight, 461);
+        assert_eq!(size.vsize, 115.25);
     }
 
     #[test]
@@ -497,21 +452,21 @@ mod tests {
         // witness = 1 + 1 + 2*72 + 1 + 105 = 252
         assert_eq!(size.input_base_bytes, 76);
         assert_eq!(size.input_witness_bytes, 252);
-        assert_eq!(size.output_bytes, 11); // empty (base = 10+76+11 = 97 >= 65)
+        assert_eq!(size.output_bytes, 14); // OP_RETURN "ash"
         assert!(size.meets_min_size());
     }
 
     // ==================== Multiple Input Tests ====================
 
     #[test]
-    fn test_multiple_p2tr_inputs_use_empty() {
+    fn test_multiple_p2tr_inputs_use_ash() {
         let size = TxSizeCalculator::new()
             .add_input(InputType::P2TR)
             .add_input(InputType::P2TR)
             .calculate();
 
-        // Multiple inputs always use empty OP_RETURN
-        assert_eq!(size.output_bytes, 11);
+        // All transactions use OP_RETURN "ash"
+        assert_eq!(size.output_bytes, 14);
         assert_eq!(size.input_base_bytes, 82); // 41 * 2
         assert_eq!(size.input_witness_bytes, 134); // 67 * 2
     }
@@ -521,7 +476,7 @@ mod tests {
         let size = TxSizeCalculator::new()
             .add_input(InputType::P2TR)
             .add_input(InputType::P2TR)
-            .calculate_with_op_return(true);
+            .calculate();
 
         assert_eq!(size.output_bytes, 14);
     }
@@ -535,7 +490,7 @@ mod tests {
 
         assert_eq!(size.input_base_bytes, 188); // 147 + 41
         assert_eq!(size.input_witness_bytes, 67); // 0 + 67
-        assert_eq!(size.output_bytes, 11); // empty (multiple inputs)
+        assert_eq!(size.output_bytes, 14); // OP_RETURN "ash"
     }
 
     #[test]
@@ -552,23 +507,23 @@ mod tests {
 
     #[test]
     fn test_ash_padding_for_small_witness_tx() {
-        // Single P2TR needs "ash" to meet 65-byte minimum
+        // Single P2TR uses OP_RETURN "ash" output
         let size = TxSizeCalculator::new()
             .add_input(InputType::P2TR)
             .calculate();
 
         assert_eq!(size.output_bytes, 14); // "ash"
-        assert_eq!(size.base_size, 65); // exactly at minimum
+        assert_eq!(size.base_size, 65); // meets 65-byte minimum
     }
 
     #[test]
     fn test_empty_for_large_enough_tx() {
-        // P2PKH is large enough without padding
+        // All transactions use OP_RETURN "ash"
         let size = TxSizeCalculator::new()
             .add_input(InputType::P2PKH)
             .calculate();
 
-        assert_eq!(size.output_bytes, 11); // empty
+        assert_eq!(size.output_bytes, 14); // OP_RETURN "ash"
         assert!(size.base_size >= 65);
     }
 
@@ -576,19 +531,9 @@ mod tests {
     fn test_force_ash_op_return() {
         let size = TxSizeCalculator::new()
             .add_input(InputType::P2PKH)
-            .calculate_with_op_return(true);
+            .calculate();
 
-        assert_eq!(size.output_bytes, 14); // forced "ash"
-    }
-
-    #[test]
-    fn test_force_empty_op_return() {
-        let size = TxSizeCalculator::new()
-            .add_input(InputType::P2TR)
-            .calculate_with_op_return(false);
-
-        assert_eq!(size.output_bytes, 11); // forced empty
-        assert!(!size.meets_min_size()); // would fail min size check
+        assert_eq!(size.output_bytes, 14); // "ash" OP_RETURN
     }
 
     // ==================== Fee Rate Tests ====================
@@ -623,7 +568,7 @@ mod tests {
         let p2pkh = TxSizeCalculator::new()
             .add_input(InputType::P2PKH)
             .calculate();
-        assert!((p2pkh.fee_rate(300) - 1.78).abs() < 0.01);
+        assert!((p2pkh.fee_rate(300) - 1.75).abs() < 0.01);
 
         let p2wpkh = TxSizeCalculator::new()
             .add_input(InputType::P2WPKH)
@@ -679,9 +624,9 @@ mod tests {
         let p2pkh = TxSizeCalculator::new()
             .add_input(InputType::P2PKH)
             .calculate();
-        assert_eq!(p2pkh.base_size, 168);
-        assert_eq!(p2pkh.weight, 672);
-        assert_eq!(p2pkh.vsize, 168.0);
+        assert_eq!(p2pkh.base_size, 171);
+        assert_eq!(p2pkh.weight, 684);
+        assert_eq!(p2pkh.vsize, 171.0);
 
         // P2WPKH
         let p2wpkh = TxSizeCalculator::new()
@@ -743,12 +688,12 @@ mod tests {
     #[test]
     fn test_batching_size_calculation() {
         // Simulate batching: Legacy (555 sats) + Bech32m
-        // First tx: overhead + P2PKH + empty OP_RETURN
+        // First tx: overhead + P2PKH + OP_RETURN "ash"
         let first_tx = TxSizeCalculator::new()
             .add_input(InputType::P2PKH)
             .calculate();
 
-        assert_eq!(first_tx.vsize, 168.0); // 10.5 rounded to 10 for overhead
+        assert_eq!(first_tx.vsize, 171.0); // 10.5 rounded to 10 for overhead
 
         // For batching, we need to calculate the combined size
         let batched = TxSizeCalculator::new()
@@ -756,7 +701,7 @@ mod tests {
             .add_input(InputType::P2TR)
             .calculate();
 
-        // Batched tx always uses empty OP_RETURN
-        assert_eq!(batched.output_bytes, 11);
+        // Batched tx uses OP_RETURN "ash"
+        assert_eq!(batched.output_bytes, 14);
     }
 }
