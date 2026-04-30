@@ -459,29 +459,6 @@ mod tests {
     // ==================== Multiple Input Tests ====================
 
     #[test]
-    fn test_multiple_p2tr_inputs_use_ash() {
-        let size = TxSizeCalculator::new()
-            .add_input(InputType::P2TR)
-            .add_input(InputType::P2TR)
-            .calculate();
-
-        // All transactions use OP_RETURN "ash"
-        assert_eq!(size.output_bytes, 14);
-        assert_eq!(size.input_base_bytes, 82); // 41 * 2
-        assert_eq!(size.input_witness_bytes, 134); // 67 * 2
-    }
-
-    #[test]
-    fn test_calculate_with_op_return_preserves_ash_for_multi_input() {
-        let size = TxSizeCalculator::new()
-            .add_input(InputType::P2TR)
-            .add_input(InputType::P2TR)
-            .calculate();
-
-        assert_eq!(size.output_bytes, 14);
-    }
-
-    #[test]
     fn test_mixed_inputs() {
         let size = TxSizeCalculator::new()
             .add_input(InputType::P2PKH)
@@ -503,37 +480,21 @@ mod tests {
         assert_eq!(size.input_witness_bytes, 201); // 67 * 3
     }
 
-    // ==================== OP_RETURN Selection Tests ====================
+    // ==================== Meets Minimum Standard Size Tests ====================
 
     #[test]
-    fn test_ash_padding_for_small_witness_tx() {
-        // Single P2TR uses OP_RETURN "ash" output
-        let size = TxSizeCalculator::new()
-            .add_input(InputType::P2TR)
-            .calculate();
+    fn test_witness_tx_size() {
+        for input_type in [
+            InputType::P2WPKH,
+            InputType::P2WSH(MultisigConfig::new(1, 2)),
+            InputType::P2TR,
+        ] {
+            // Single P2TR would be too small without OP_RETURN "ash" output
+            let size = TxSizeCalculator::new().add_input(input_type).calculate();
 
-        assert_eq!(size.output_bytes, 14); // "ash"
-        assert_eq!(size.base_size, 65); // meets 65-byte minimum
-    }
-
-    #[test]
-    fn test_empty_for_large_enough_tx() {
-        // All transactions use OP_RETURN "ash"
-        let size = TxSizeCalculator::new()
-            .add_input(InputType::P2PKH)
-            .calculate();
-
-        assert_eq!(size.output_bytes, 14); // OP_RETURN "ash"
-        assert!(size.base_size >= 65);
-    }
-
-    #[test]
-    fn test_force_ash_op_return() {
-        let size = TxSizeCalculator::new()
-            .add_input(InputType::P2PKH)
-            .calculate();
-
-        assert_eq!(size.output_bytes, 14); // "ash" OP_RETURN
+            assert_eq!(size.output_bytes, 14); // "ash"
+            assert_eq!(size.base_size, 65); // meets 65-byte minimum
+        }
     }
 
     // ==================== Fee Rate Tests ====================

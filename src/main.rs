@@ -1004,7 +1004,7 @@ mod tests {
     /// Spend multiple dust UTXOs.
     #[test]
     fn test_spend_multiple_utxos() {
-        // multiple UTXOs always produce empty OP_RETURN regardless of script type or sig count
+        // multiple UTXOs always produce valid dust disposal txs, legacy or witness script dust
         run_spend_test(&AddressType::Legacy, 600, 3);
         run_spend_test(&AddressType::Bech32m, 546, 3);
     }
