@@ -1102,7 +1102,6 @@ mod tests {
     ) {
         assert!(addr1_input_count >= 1, "addr1_input_count must be >= 1");
         let ctx = setup_ctx();
-
         let addr1 = ctx.env.new_address(&ctx.wallet1_name, addr1_type);
         for _ in 0..addr1_input_count {
             ctx.env.send_to_address(&addr1, amt1_per_input);
@@ -1114,7 +1113,7 @@ mod tests {
         let orig_fee = amt1_per_input * (addr1_input_count as u64);
         let orig_inputs = vec![addr1_input; addr1_input_count];
         let min_sats = min_sats_for_batching(orig_fee, &orig_inputs, addr2_input);
-        let amt2 = min_sats + Amount::ONE_SAT;
+        let amt2 = min_sats + Amount::from_sat(8);
         ctx.env.send_to_address(&addr2, amt2);
         ctx.env
             .send_to_address(&addr2_insufficient_sats, min_sats - Amount::ONE_SAT);
@@ -1407,7 +1406,6 @@ mod tests {
     #[test]
     fn test_batch_pick_batchable() {
         let ctx = setup_ctx();
-
         // addresses
         let addr1 = ctx
             .env
@@ -1427,7 +1425,7 @@ mod tests {
 
         // step 2 (new P2TR input): > min_sats_for_batching(tx1) batches the previous p2tr input.
         let min_sats_p2tr_p2tr = min_sats_for_batching(amt1, &[InputType::P2TR], InputType::P2TR);
-        let amt_batch_p2tr_p2tr = min_sats_p2tr_p2tr + Amount::ONE_SAT;
+        let amt_batch_p2tr_p2tr = min_sats_p2tr_p2tr + Amount::from_sat(4);
         ctx.env.send_to_address(&addr2, amt_batch_p2tr_p2tr);
 
         // step 3 (new P2PKH input): doesn't batch
@@ -1451,7 +1449,7 @@ mod tests {
         // step 5 (new P2TR input): just enough to batch the P2WPKH input (but not P2PKH)
         let min_sats_p2tr_batch_p2wpkh =
             min_sats_for_batching(amt_p2wpkh_no_batch, &[InputType::P2WPKH], InputType::P2TR);
-        let amt_p2tr_batch = min_sats_p2tr_batch_p2wpkh + Amount::ONE_SAT;
+        let amt_p2tr_batch = min_sats_p2tr_batch_p2wpkh + Amount::from_sat(4);
         ctx.env.send_to_address(&addr5, amt_p2tr_batch);
 
         ctx.env.mine_blocks(1);

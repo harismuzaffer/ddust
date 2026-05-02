@@ -18,9 +18,9 @@ jobs:
       - uses: actions/checkout@v5
       - name: Download bitcoind
         run: |
-          wget -q https://bitcoincore.org/bin/bitcoin-core-30.2/bitcoin-30.2-x86_64-linux-gnu.tar.gz
-          tar xzf bitcoin-30.2-x86_64-linux-gnu.tar.gz
-          echo "BITCOIND_EXE=$PWD/bitcoin-30.2/bin/bitcoind" >> $GITHUB_ENV
+          wget -q https://bitcoincore.org/bin/bitcoin-core-31.0/bitcoin-31.0-x86_64-linux-gnu.tar.gz
+          tar xzf bitcoin-31.0-x86_64-linux-gnu.tar.gz
+          echo "BITCOIND_EXE=$PWD/bitcoin-31.0/bin/bitcoind" >> $GITHUB_ENV
       - name: Check fmt
         run: cargo fmt --all --check
       - name: Clippy

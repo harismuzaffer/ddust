@@ -83,9 +83,9 @@ export BITCOIND_EXE=/path/to/bitcoind
 If you don't have `bitcoind` installed, download it from [bitcoincore.org](https://bitcoincore.org/en/download/):
 ```bash
 # Example for Linux
-wget https://bitcoincore.org/bin/bitcoin-core-30.2/bitcoin-30.2-x86_64-linux-gnu.tar.gz
-tar xzf bitcoin-30.2-x86_64-linux-gnu.tar.gz
-export BITCOIND_EXE=$PWD/bitcoin-30.2/bin/bitcoind
+wget https://bitcoincore.org/bin/bitcoin-core-31.0/bitcoin-31.0-x86_64-linux-gnu.tar.gz
+tar xzf bitcoin-31.0-x86_64-linux-gnu.tar.gz
+export BITCOIND_EXE=$PWD/bitcoin-31.0/bin/bitcoind
 ```
 
 ### Running tests
@@ -98,6 +98,6 @@ just test
 
 - rust 1.92+
 - a local bitcoin core node
-  - version 30+
+  - version 31+
   - RPC enabled
   - cookie file authentication
