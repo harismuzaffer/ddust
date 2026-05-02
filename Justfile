@@ -53,7 +53,7 @@ start:
     if [ ! -d "{{datadir}}" ]; then \
         mkdir -p "{{datadir}}"; \
     fi
-    bitcoind -datadir={{datadir}} -chain={{chain}} -txindex -server -fallbackfee=0.0002 -blockfilterindex=1 -peerblockfilters=1 -rpcallowip=0.0.0.0/0 -rpcbind=0.0.0.0 -daemon
+    bitcoind -datadir={{datadir}} -chain={{chain}} -txindex -server -proxy=127.0.0.1:9050 -privatebroadcast -fallbackfee=0.0002 -blockfilterindex=1 -peerblockfilters=1 -rpcallowip=0.0.0.0/0 -rpcbind=0.0.0.0 -daemon
 
 # stop bitcoind
 [group('rpc')]

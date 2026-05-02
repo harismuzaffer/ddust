@@ -97,7 +97,10 @@ just test
 ## Requirements
 
 - rust 1.92+
+- a local tor proxy daemon
 - a local bitcoin core node
   - version 31+
-  - RPC enabled
+  - RPC enabled (e.g. "-rpcallowip=0.0.0.0/0 -rpcbind=0.0.0.0")
+  - privatebroadcast enabled (e.g. "-privatebroadcast")
+  - TOR proxy enabled (e.g. "-proxy=127.0.0.1:9050")
   - cookie file authentication
