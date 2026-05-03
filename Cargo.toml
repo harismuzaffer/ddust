@@ -6,9 +6,9 @@ authors = ["bubb1es71 <bubb1es71@proton.me>"]
 license = "MIT"
 
 [dependencies]
-bdk_wallet = "2"
+bdk_wallet = "3"
 bdk_bitcoind_rpc = "0.22"
-bdk_redb = "0.1.1"
+bdk_redb = "0.2"
 clap = { version = "4", features = ["derive", "env"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

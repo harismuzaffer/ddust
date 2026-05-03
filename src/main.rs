@@ -89,7 +89,7 @@ fn cmd_add(
     desc: ExtendedDescriptor,
     start_height: u32,
 ) {
-    let wallet_name = wallet_name_from_descriptor(desc.clone(), None, network, secp)
+    let wallet_name = wallet_name_from_descriptor(desc.clone(), None, network.into(), secp)
         .expect("must be a valid descriptor");
 
     if let (Some(mut wallet), mut store) = load_wallet(db.clone(), network, wallet_name) {
@@ -383,8 +383,9 @@ fn create_wallet(
     start_height: u32,
     rpc_client: &Client,
 ) -> (PersistedWallet<Store>, Store) {
-    let wallet_name = wallet_name_from_descriptor(single_descriptor.clone(), None, network, secp)
-        .expect("must be a valid descriptor");
+    let wallet_name =
+        wallet_name_from_descriptor(single_descriptor.clone(), None, network.into(), secp)
+            .expect("must be a valid descriptor");
     let mut wallet_store = Store::new(db.clone(), wallet_name).expect("db store not created");
     let mut wallet = Wallet::create_single(single_descriptor)
         .network(network)
