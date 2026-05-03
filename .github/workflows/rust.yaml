@@ -16,11 +16,19 @@ jobs:
 
     steps:
       - uses: actions/checkout@v5
+      - name: Cache bitcoind
+        id: cache-bitcoind
+        uses: actions/cache@v5
+        with:
+          path: bitcoin-31.0
+          key: ${{ runner.os }}-bitcoind
       - name: Download bitcoind
+        if: steps.cache-bitcoind.outputs.cache-hit != 'true'
         run: |
           wget -q https://bitcoincore.org/bin/bitcoin-core-31.0/bitcoin-31.0-x86_64-linux-gnu.tar.gz
           tar xzf bitcoin-31.0-x86_64-linux-gnu.tar.gz
-          echo "BITCOIND_EXE=$PWD/bitcoin-31.0/bin/bitcoind" >> $GITHUB_ENV
+      - name: Set BITCOIND_EXE env
+        run: echo "BITCOIND_EXE=$PWD/bitcoin-31.0/bin/bitcoind" >> $GITHUB_ENV
       - name: Check fmt
         run: cargo fmt --all --check
       - name: Clippy
