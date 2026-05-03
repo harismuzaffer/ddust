@@ -16,6 +16,10 @@ jobs:
 
     steps:
       - uses: actions/checkout@v5
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
       - name: Cache bitcoind
         id: cache-bitcoind
         uses: actions/cache@v5
