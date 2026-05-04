@@ -652,7 +652,14 @@ impl CandidateTx {
     fn new(tx: &Transaction, rpc_client: &Client) -> Self {
         let entry = rpc_client.get_mempool_entry(&tx.compute_txid()).unwrap();
         let fee = entry.fees.base;
-        let rate = fee.to_sat() as f64 / entry.vsize as f64;
+        // Use weight/4 (exact) instead of entry.vsize (rounded up to integer): Core 31.0
+        // mempool implementation uses TxGraph with entries using FeePerWeight, not vsize
+        let rate = fee.to_sat() as f64
+            / ((entry
+                .weight
+                .expect("getmempoolentry must return weight (Core 0.19.0+)")
+                as f64)
+                / 4.0);
         Self {
             tx: tx.clone(),
             fee,
@@ -741,11 +748,11 @@ fn find_batchable_txs(
 
         let new_amount = combined_amount + c.fee;
         let new_vsize = combined_vsize + c.input_vsize + bump;
-        let new_rate = new_amount.to_sat() as f64 / new_vsize.ceil();
+        let new_rate = new_amount.to_sat() as f64 / new_vsize;
 
         // Replacement must (1) pay for its own bandwidth (0.1 sat/vB incremental relay)
         // and (2) exceed every replaced tx's fee rate.
-        let bandwidth_ok = dust_sats >= 0.1 * new_vsize.ceil();
+        let bandwidth_ok = dust_sats >= 0.1 * new_vsize;
         let rate_ok = new_rate > c.rate;
         if !(bandwidth_ok && rate_ok) {
             // Sorted ascending by rate, so subsequent txs only make both checks harder.
@@ -1079,14 +1086,14 @@ mod tests {
             orig_tx = orig_tx.add_input(*input_type);
         }
         let orig_breakdown = orig_tx.calculate();
-        let orig_tx_vsize = orig_breakdown.vsize.ceil();
+        let orig_tx_vsize = orig_breakdown.vsize;
         let replacement_tx = orig_tx.add_input(replacement_tx_input_type);
-        let replacement_tx_vsize = replacement_tx.calculate().vsize.ceil();
+        let replacement_tx_vsize = replacement_tx.calculate().vsize;
         let fee_rate = orig_tx_fee.to_sat() as f64 / orig_tx_vsize;
         // requires atleast `sats` at the fee rate of the original tx
-        let rate_min_sats = (fee_rate * replacement_tx_vsize).ceil() as u64 - orig_tx_fee.to_sat();
+        let rate_min_sats = (fee_rate * replacement_tx_vsize) as u64 - orig_tx_fee.to_sat();
         // requires `sats` that pay the replacement_vsize at the relay rate
-        let bandwidth_min_sats = (0.1 * replacement_tx_vsize).ceil() as u64;
+        let bandwidth_min_sats = (0.1 * replacement_tx_vsize) as u64;
         Amount::from_sat(bandwidth_min_sats.max(rate_min_sats))
     }
     /// Sends `amt1_per_input` to a fresh `addr1_type` address `addr1_input_count` times so
@@ -1113,7 +1120,7 @@ mod tests {
         let orig_fee = amt1_per_input * (addr1_input_count as u64);
         let orig_inputs = vec![addr1_input; addr1_input_count];
         let min_sats = min_sats_for_batching(orig_fee, &orig_inputs, addr2_input);
-        let amt2 = min_sats + Amount::from_sat(8);
+        let amt2 = min_sats + Amount::ONE_SAT;
         ctx.env.send_to_address(&addr2, amt2);
         ctx.env
             .send_to_address(&addr2_insufficient_sats, min_sats - Amount::ONE_SAT);
@@ -1425,7 +1432,7 @@ mod tests {
 
         // step 2 (new P2TR input): > min_sats_for_batching(tx1) batches the previous p2tr input.
         let min_sats_p2tr_p2tr = min_sats_for_batching(amt1, &[InputType::P2TR], InputType::P2TR);
-        let amt_batch_p2tr_p2tr = min_sats_p2tr_p2tr + Amount::from_sat(4);
+        let amt_batch_p2tr_p2tr = min_sats_p2tr_p2tr + Amount::ONE_SAT;
         ctx.env.send_to_address(&addr2, amt_batch_p2tr_p2tr);
 
         // step 3 (new P2PKH input): doesn't batch
@@ -1449,7 +1456,7 @@ mod tests {
         // step 5 (new P2TR input): just enough to batch the P2WPKH input (but not P2PKH)
         let min_sats_p2tr_batch_p2wpkh =
             min_sats_for_batching(amt_p2wpkh_no_batch, &[InputType::P2WPKH], InputType::P2TR);
-        let amt_p2tr_batch = min_sats_p2tr_batch_p2wpkh + Amount::from_sat(4);
+        let amt_p2tr_batch = min_sats_p2tr_batch_p2wpkh + Amount::ONE_SAT;
         ctx.env.send_to_address(&addr5, amt_p2tr_batch);
 
         ctx.env.mine_blocks(1);
