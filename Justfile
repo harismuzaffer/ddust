@@ -142,6 +142,27 @@ descriptors private:
 [group('rpc')]
 sign psbt:
     bitcoin-cli -datadir={{datadir}} -chain={{chain}} -rpcwallet={{wallet}} walletprocesspsbt '{{psbt}}' true "ALL|ANYONECANPAY"
+
+# lock a UTXO
+[group('rpc')]
+lock txid vout:
+    bitcoin-cli -datadir={{datadir}} -chain={{chain}} -rpcwallet={{wallet}} lockunspent false '[{"txid":"{{txid}}","vout":{{vout}}}]'
+
+# unlock a UTXO
+[group('rpc')]
+unlock txid vout:
+    bitcoin-cli -datadir={{datadir}} -chain={{chain}} -rpcwallet={{wallet}} lockunspent true '[{"txid":"{{txid}}","vout":{{vout}}}]'
+
+# list locked UTXOs
+[group('rpc')]
+locks:
+    bitcoin-cli -datadir={{datadir}} -chain={{chain}} -rpcwallet={{wallet}} listlockunspent
+
+# send all unlocked UTXOs
+[group('rpc')]
+sendall address:
+    bitcoin-cli -datadir={{datadir}} -chain={{chain}} -rpcwallet={{wallet}} sendall '["{{address}}"]'
+
 # run any bitcoin-cli rpc command
 [group('rpc')]
 rpc *command:
