@@ -56,6 +56,17 @@ Options:
   -V, --version                    Print version
 ```
 
+## Address public-key exposure
+
+By default, `list` and `spend` skip dust UTXOs at any address that also holds an unspent non-dust UTXO. Disposing of the dust reveals the public key for that address, which exposes the unspent non-dust UTXOs to a hypothetical future long-term quantum attack.
+
+Pass `--unsafe` to either command to override this check and operate on the dust anyway:
+
+```bash
+ddust list --unsafe
+ddust spend <address> --unsafe
+```
+
 ## Mempool Batching
 
 When running `spend`, ddust scans the mempool for existing unconfirmed ddust transactions identified by a single OP_RETURN output and inputs signed with sighash `ALL|ANYONECANPAY`. If matching transactions are found, ddust checks whether batching them with the new dust inputs would satisfy RBF replacement rules: the combined fee rate must exceed the highest existing ddust transaction fee rate by at least 0.1 sat/vB.
