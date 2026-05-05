@@ -21,6 +21,7 @@ use bdk_wallet::chain::{CanonicalizationParams, CheckPoint};
 use bdk_wallet::serde::Serialize;
 use bdk_wallet::{LocalOutput, PersistedWallet, Wallet, miniscript, wallet_name_from_descriptor};
 use clap::{Parser, Subcommand, ValueEnum};
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::Arc;
@@ -61,16 +62,26 @@ fn main() {
         Commands::Add { desc, start_height } => {
             cmd_add(&secp, &db, network, &rpc_client, desc, start_height);
         }
-        Commands::List => {
-            let dust = cmd_list(&db, network, &rpc_client, dust_amount);
+        Commands::List { unsafe_select } => {
+            let dust = cmd_list(&db, network, &rpc_client, dust_amount, unsafe_select);
             println!("{}", serde_json::to_string_pretty(&dust).unwrap());
         }
-        Commands::Spend { address } => {
+        Commands::Spend {
+            address,
+            unsafe_select,
+        } => {
             let filter_address = Address::from_str(&address)
                 .expect("failed to parse filter address")
                 .require_network(network)
                 .expect("invalid network");
-            if let Some(psbt) = cmd_spend(&db, network, &rpc_client, dust_amount, filter_address) {
+            if let Some(psbt) = cmd_spend(
+                &db,
+                network,
+                &rpc_client,
+                dust_amount,
+                filter_address,
+                unsafe_select,
+            ) {
                 println!("{}", psbt);
             }
         }
@@ -102,11 +113,25 @@ fn cmd_add(
     }
 }
 
+/// Addresses in the wallet that hold any unspent non-dust UTXO.
+fn non_dust_addresses(
+    wallet: &PersistedWallet<Store>,
+    network: Network,
+    dust_amount: &Amount,
+) -> HashSet<Address> {
+    wallet
+        .list_unspent()
+        .filter(|out| !out.is_spent && out.txout.value > *dust_amount)
+        .filter_map(|out| Address::from_script(&out.txout.script_pubkey, network).ok())
+        .collect()
+}
+
 fn cmd_list(
     db: &Arc<Database>,
     network: Network,
     rpc_client: &Client,
     dust_amount: Amount,
+    unsafe_select: bool,
 ) -> Vec<Dust> {
     let mut found_dust = Vec::new();
     for wallet_name in wallet_names(db.clone()) {
@@ -114,19 +139,35 @@ fn cmd_list(
         if let (Some(mut wallet), mut store) = load_wallet(db.clone(), network, wallet_name.clone())
         {
             sync_wallet(rpc_client, &mut wallet, &mut store);
+            let skip_addrs = if unsafe_select {
+                HashSet::new()
+            } else {
+                non_dust_addresses(&wallet, network, &dust_amount)
+            };
+            let mut skipped: HashSet<Address> = HashSet::new();
             wallet.list_unspent().for_each(|out| {
                 if is_dust(&out, &dust_amount) {
                     let address = Address::from_script(&out.txout.script_pubkey, network)
-                        .expect("failed to get address")
-                        .to_string();
+                        .expect("failed to get address");
+                    if skip_addrs.contains(&address) {
+                        skipped.insert(address);
+                        return;
+                    }
                     let value = out.txout.value.to_sat() as u32;
                     found_dust.push(Dust {
-                        address,
+                        address: address.to_string(),
                         value,
                         outpoint: out.outpoint,
                     });
                 }
             });
+            if !skipped.is_empty() {
+                debug!(
+                    "skipped dust at {} address(es) with non-dust UTXOs (use --unsafe to override): {:?}",
+                    skipped.len(),
+                    skipped
+                );
+            }
         } else {
             error!("could not load wallet with name {}", wallet_name);
         }
@@ -140,12 +181,24 @@ fn cmd_spend(
     rpc_client: &Client,
     dust_amount: Amount,
     filter_address: Address,
+    unsafe_select: bool,
 ) -> Option<Psbt> {
     for wallet_name in wallet_names(db.clone()) {
         debug!("wallet: {}", wallet_name);
         if let (Some(mut wallet), mut store) = load_wallet(db.clone(), network, wallet_name.clone())
         {
             sync_wallet(rpc_client, &mut wallet, &mut store);
+            // Refuse to dispose dust at addresses that also hold non-dust UTXOs:
+            // prevents exposing the address's public key to a theoretical future long-range quantum attack.
+            if !unsafe_select
+                && non_dust_addresses(&wallet, network, &dust_amount).contains(&filter_address)
+            {
+                debug!(
+                    "skipping {}: address has unspent non-dust UTXOs (use --unsafe to override)",
+                    filter_address
+                );
+                return None;
+            }
             let dust = wallet
                 .list_unspent()
                 .filter_map(|out| {
@@ -250,11 +303,20 @@ enum Commands {
         start_height: u32,
     },
     /// List all dust UTXOs in your wallet descriptor(s), returns json array
-    List,
+    List {
+        /// Include dust at addresses that also have unspent non-dust UTXOs.
+        /// Default: skip such dust to avoid revealing the address's public key.
+        #[arg(long = "unsafe", default_value_t = false)]
+        unsafe_select: bool,
+    },
     /// Spend dust UTXOs to an OP_RETURN, the entire amount goes to fees, returns PSBT
     Spend {
         /// Bitcoin address of dust to be spent
         address: String,
+        /// Spend dust at the address even if it also has unspent non-dust UTXOs.
+        /// Default: refuse, to avoid revealing the address's public key
+        #[arg(long = "unsafe", default_value_t = false)]
+        unsafe_select: bool,
     },
     /// Broadcast a PSBT after it's been signed, returns txid
     Broadcast {
@@ -871,7 +933,10 @@ mod tests {
         ctx.env.send_to_address(&addr3, Amount::from_sat(600));
 
         ctx.env.mine_blocks(1);
-        let dust = cmd_list(&ctx.db, ctx.network, &ctx.rpc_client, dust_sats);
+        let dust = cmd_list(&ctx.db, ctx.network, &ctx.rpc_client, dust_sats, false);
+        assert_eq!(dust.len(), 1);
+
+        let dust = cmd_list(&ctx.db, ctx.network, &ctx.rpc_client, dust_sats, true);
         assert_eq!(dust.len(), 4);
     }
 
@@ -911,7 +976,7 @@ mod tests {
             start_height,
         );
 
-        let dust = cmd_list(&ctx.db, ctx.network, &ctx.rpc_client, dust_sats);
+        let dust = cmd_list(&ctx.db, ctx.network, &ctx.rpc_client, dust_sats, false);
         assert_eq!(
             dust.len(),
             2,
@@ -942,7 +1007,7 @@ mod tests {
             .get_descriptor(&ctx.wallet1_name, &AddressType::Bech32m);
         cmd_add(&ctx.secp, &ctx.db, ctx.network, &ctx.rpc_client, desc, 0);
 
-        let dust = cmd_list(&ctx.db, ctx.network, &ctx.rpc_client, dust_sats);
+        let dust = cmd_list(&ctx.db, ctx.network, &ctx.rpc_client, dust_sats, false);
         assert_eq!(dust.len(), 1, "should only find confirmed dust utxos");
     }
 
@@ -988,6 +1053,7 @@ mod tests {
             &ctx.rpc_client,
             Amount::from_sat(dust_sats),
             addr,
+            false,
         );
         assert!(result.is_some(), "expected a psbt to be created");
 
@@ -1035,8 +1101,73 @@ mod tests {
         ctx.env.send_to_address(&addr, Amount::from_sat(1500));
         ctx.env.mine_blocks(1);
 
-        let result = cmd_spend(&ctx.db, ctx.network, &ctx.rpc_client, dust_sats, addr);
+        let result = cmd_spend(
+            &ctx.db,
+            ctx.network,
+            &ctx.rpc_client,
+            dust_sats,
+            addr,
+            false,
+        );
         assert!(result.is_none(), "expected no Psbt created");
+    }
+
+    /// Address has both dust and non-dust UTXOs: cmd_spend (safe default) refuses to dispose
+    /// the dust
+    #[test]
+    fn test_spend_skips_dust_when_address_has_non_dust() {
+        let ctx = TestContext::new();
+        let dust_sats = Amount::from_sat(555);
+
+        let desc = ctx
+            .env
+            .get_descriptor(&ctx.wallet1_name, &AddressType::Bech32m);
+        cmd_add(&ctx.secp, &ctx.db, ctx.network, &ctx.rpc_client, desc, 0);
+
+        let addr = ctx
+            .env
+            .new_address(&ctx.wallet1_name, &AddressType::Bech32m);
+        ctx.env.send_to_address(&addr, Amount::from_sat(400)); // dust
+        ctx.env.send_to_address(&addr, Amount::from_sat(1500)); // non-dust
+        ctx.env.mine_blocks(1);
+
+        let result = cmd_spend(
+            &ctx.db,
+            ctx.network,
+            &ctx.rpc_client,
+            dust_sats,
+            addr,
+            false,
+        );
+        assert!(
+            result.is_none(),
+            "expected no Psbt: address has non-dust UTXOs"
+        );
+    }
+
+    /// Address has both dust and non-dust UTXOs: cmd_spend with `--unsafe` bypasses the
+    /// public-key-exposure check and disposes the dust anyway.
+    #[test]
+    fn test_spend_unsafe_disposes_dust_when_address_has_non_dust() {
+        let ctx = TestContext::new();
+        let dust_sats = Amount::from_sat(555);
+
+        let desc = ctx
+            .env
+            .get_descriptor(&ctx.wallet1_name, &AddressType::Bech32m);
+        cmd_add(&ctx.secp, &ctx.db, ctx.network, &ctx.rpc_client, desc, 0);
+
+        let addr = ctx
+            .env
+            .new_address(&ctx.wallet1_name, &AddressType::Bech32m);
+        ctx.env.send_to_address(&addr, Amount::from_sat(400)); // dust
+        ctx.env.send_to_address(&addr, Amount::from_sat(300)); // dust
+        ctx.env.send_to_address(&addr, Amount::from_sat(1500)); // non-dust
+        ctx.env.mine_blocks(1);
+
+        let psbt = cmd_spend(&ctx.db, ctx.network, &ctx.rpc_client, dust_sats, addr, true).unwrap();
+        let signed = ctx.env.wallet_process_psbt(&ctx.wallet1_name, &psbt);
+        broadcast_and_assert(&ctx, signed, 2);
     }
 
     /// Spend a 2-of-2 P2SH multisig dust UTXO
@@ -1060,6 +1191,7 @@ mod tests {
             &ctx.rpc_client,
             Amount::from_sat(600),
             addr,
+            false,
         );
         assert!(result.is_some(), "expected a psbt to be created");
         let psbt = result.unwrap();
@@ -1130,7 +1262,15 @@ mod tests {
         let dust_sats = amt1_per_input.max(amt2);
 
         // first tx
-        let psbt = cmd_spend(&ctx.db, ctx.network, &ctx.rpc_client, dust_sats, addr1).unwrap();
+        let psbt = cmd_spend(
+            &ctx.db,
+            ctx.network,
+            &ctx.rpc_client,
+            dust_sats,
+            addr1,
+            false,
+        )
+        .unwrap();
         let signed = ctx.env.wallet_process_psbt(&ctx.wallet1_name, &psbt);
         broadcast_and_assert(&ctx, signed, addr1_input_count);
 
@@ -1142,13 +1282,21 @@ mod tests {
             &ctx.rpc_client,
             dust_sats,
             addr2_insufficient_sats,
+            false,
         )
         .unwrap();
         assert_eq!(psbt.inputs.len(), 1);
 
         // spend addr2 and expect batch of the mempool ddust tx
-        let psbt_batched =
-            cmd_spend(&ctx.db, ctx.network, &ctx.rpc_client, dust_sats, addr2).unwrap();
+        let psbt_batched = cmd_spend(
+            &ctx.db,
+            ctx.network,
+            &ctx.rpc_client,
+            dust_sats,
+            addr2,
+            false,
+        )
+        .unwrap();
         let signed = ctx
             .env
             .wallet_process_psbt(&ctx.wallet2_name, &psbt_batched);
@@ -1388,14 +1536,29 @@ mod tests {
         ctx.env.mine_blocks(1);
 
         let dust_sats = Amount::from_sat(1000);
-        let psbt = cmd_spend(&ctx.db, ctx.network, &ctx.rpc_client, dust_sats, addr1).unwrap();
+        let psbt = cmd_spend(
+            &ctx.db,
+            ctx.network,
+            &ctx.rpc_client,
+            dust_sats,
+            addr1,
+            false,
+        )
+        .unwrap();
         let signed = ctx.env.wallet_process_psbt(&ctx.wallet1_name, &psbt);
         broadcast_and_assert(&ctx, signed, 1);
 
         // spend addr2 and expect this tx doesn't replace the original tx because the new fee rate
         // is not enough to replace the mempool tx
-        let psbt_batched =
-            cmd_spend(&ctx.db, ctx.network, &ctx.rpc_client, dust_sats, addr2).unwrap();
+        let psbt_batched = cmd_spend(
+            &ctx.db,
+            ctx.network,
+            &ctx.rpc_client,
+            dust_sats,
+            addr2,
+            false,
+        )
+        .unwrap();
         let signed = ctx
             .env
             .wallet_process_psbt(&ctx.wallet2_name, &psbt_batched);
@@ -1464,27 +1627,67 @@ mod tests {
         let dust_sats = Amount::from_sat(2500);
 
         // 1. spend addr1 - standalone (no mempool ddust yet)
-        let psbt = cmd_spend(&ctx.db, ctx.network, &ctx.rpc_client, dust_sats, addr1).unwrap();
+        let psbt = cmd_spend(
+            &ctx.db,
+            ctx.network,
+            &ctx.rpc_client,
+            dust_sats,
+            addr1,
+            false,
+        )
+        .unwrap();
         let signed = ctx.env.wallet_process_psbt(&ctx.wallet1_name, &psbt);
         broadcast_and_assert(&ctx, signed, 1);
 
         // 2. spend addr2 - batches input from previous tx
-        let psbt = cmd_spend(&ctx.db, ctx.network, &ctx.rpc_client, dust_sats, addr2).unwrap();
+        let psbt = cmd_spend(
+            &ctx.db,
+            ctx.network,
+            &ctx.rpc_client,
+            dust_sats,
+            addr2,
+            false,
+        )
+        .unwrap();
         let signed = ctx.env.wallet_process_psbt(&ctx.wallet2_name, &psbt);
         broadcast_and_assert(&ctx, signed, 2);
 
         // 3. spend addr3 - standalone (P2PKH amount below the lowest batch threshold)
-        let psbt = cmd_spend(&ctx.db, ctx.network, &ctx.rpc_client, dust_sats, addr3).unwrap();
+        let psbt = cmd_spend(
+            &ctx.db,
+            ctx.network,
+            &ctx.rpc_client,
+            dust_sats,
+            addr3,
+            false,
+        )
+        .unwrap();
         let signed = ctx.env.wallet_process_psbt(&ctx.wallet1_name, &psbt);
         broadcast_and_assert(&ctx, signed, 1);
 
         // 4. spend addr4 - standalone (P2WPKH amount below the lowest batch threshold)
-        let psbt = cmd_spend(&ctx.db, ctx.network, &ctx.rpc_client, dust_sats, addr4).unwrap();
+        let psbt = cmd_spend(
+            &ctx.db,
+            ctx.network,
+            &ctx.rpc_client,
+            dust_sats,
+            addr4,
+            false,
+        )
+        .unwrap();
         let signed = ctx.env.wallet_process_psbt(&ctx.wallet1_name, &psbt);
         broadcast_and_assert(&ctx, signed, 1);
 
         // 5. spend addr5 - batches 1 unconfirmed tx into a single 2-input replacement.
-        let psbt = cmd_spend(&ctx.db, ctx.network, &ctx.rpc_client, dust_sats, addr5).unwrap();
+        let psbt = cmd_spend(
+            &ctx.db,
+            ctx.network,
+            &ctx.rpc_client,
+            dust_sats,
+            addr5,
+            false,
+        )
+        .unwrap();
         let signed = ctx.env.wallet_process_psbt(&ctx.wallet2_name, &psbt);
         broadcast_and_assert(&ctx, signed, 2);
     }
@@ -1528,7 +1731,15 @@ mod tests {
         // spend each dust UTXO as a standalone ddust tx, mining a block after each
         // to confirm it (preventing batching)
         for addr in addressses {
-            let psbt = cmd_spend(&ctx.db, ctx.network, &ctx.rpc_client, dust_sats, addr).unwrap();
+            let psbt = cmd_spend(
+                &ctx.db,
+                ctx.network,
+                &ctx.rpc_client,
+                dust_sats,
+                addr,
+                false,
+            )
+            .unwrap();
             let signed = ctx.env.wallet_process_psbt(&ctx.wallet1_name, &psbt);
             broadcast_and_assert(&ctx, signed, 1);
             ctx.env.mine_blocks(1);
@@ -1556,6 +1767,7 @@ mod tests {
             &ctx.rpc_client,
             dust_sats,
             addr_batcher1,
+            false,
         )
         .unwrap();
         let signed = ctx.env.wallet_process_psbt(&ctx.wallet1_name, &psbt);
@@ -1569,6 +1781,7 @@ mod tests {
             &ctx.rpc_client,
             dust_sats,
             addr_batcher2,
+            false,
         )
         .unwrap();
         let signed = ctx.env.wallet_process_psbt(&ctx.wallet1_name, &psbt);
