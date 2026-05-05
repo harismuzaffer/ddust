@@ -19,7 +19,9 @@ use bdk_wallet::bitcoin::script::Instruction;
 use bdk_wallet::bitcoin::script::PushBytesBuf;
 use bdk_wallet::chain::{CanonicalizationParams, CheckPoint};
 use bdk_wallet::serde::Serialize;
-use bdk_wallet::{LocalOutput, PersistedWallet, Wallet, miniscript, wallet_name_from_descriptor};
+use bdk_wallet::{
+    KeychainKind, LocalOutput, PersistedWallet, Wallet, miniscript, wallet_name_from_descriptor,
+};
 use clap::{Parser, Subcommand, ValueEnum};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -59,6 +61,11 @@ fn main() {
     let rpc_client = Client::new(&url, auth.clone()).expect("failed to create rpc client");
 
     match args.command {
+        Commands::Desc => {
+            cmd_desc(&db, network).iter().for_each(|desc| {
+                println!("{}", desc);
+            });
+        }
         Commands::Add { desc, start_height } => {
             cmd_add(&secp, &db, network, &rpc_client, desc, start_height);
         }
@@ -90,6 +97,22 @@ fn main() {
             println!("{}", txid);
         }
     }
+}
+
+fn cmd_desc(db: &Arc<Database>, network: Network) -> Vec<ExtendedDescriptor> {
+    wallet_names(db.clone())
+        .iter()
+        .filter_map(|wallet_name| {
+            debug!("wallet: {}", wallet_name);
+            if let (Some(wallet), mut _store) =
+                load_wallet(db.clone(), network, wallet_name.clone())
+            {
+                Some(wallet.public_descriptor(KeychainKind::External).clone())
+            } else {
+                None
+            }
+        })
+        .collect()
 }
 
 fn cmd_add(
@@ -293,6 +316,8 @@ pub struct CliArgs {
 
 #[derive(Subcommand, Debug)]
 enum Commands {
+    /// List public key descriptor that will be scanned for dust UTXOs
+    Desc,
     /// Add a public key descriptor to scan for dust UTXOs
     Add {
         /// Descriptor to add
@@ -938,6 +963,28 @@ mod tests {
 
         let dust = cmd_list(&ctx.db, ctx.network, &ctx.rpc_client, dust_sats, true);
         assert_eq!(dust.len(), 4);
+    }
+
+    /// Add descriptors and list them with cmd_desc
+    #[test]
+    fn test_cmd_add_desc() {
+        let ctx = TestContext::new();
+
+        let desc = ctx
+            .env
+            .get_descriptor(&ctx.wallet1_name, &AddressType::Bech32m);
+        cmd_add(&ctx.secp, &ctx.db, ctx.network, &ctx.rpc_client, desc, 0);
+        let desc = ctx
+            .env
+            .get_descriptor(&ctx.wallet1_name, &AddressType::Bech32);
+        cmd_add(&ctx.secp, &ctx.db, ctx.network, &ctx.rpc_client, desc, 0);
+        let desc = ctx
+            .env
+            .get_descriptor(&ctx.wallet1_name, &AddressType::Legacy);
+        cmd_add(&ctx.secp, &ctx.db, ctx.network, &ctx.rpc_client, desc, 0);
+
+        let descriptors = cmd_desc(&ctx.db, ctx.network);
+        assert_eq!(descriptors.len(), 3);
     }
 
     /// Add a descriptor with start_height > 0 and verify that dust sent
