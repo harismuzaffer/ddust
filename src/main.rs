@@ -316,7 +316,7 @@ pub struct CliArgs {
 
 #[derive(Subcommand, Debug)]
 enum Commands {
-    /// List public key descriptor that will be scanned for dust UTXOs
+    /// List public key descriptors that will be scanned for dust UTXOs
     Desc,
     /// Add a public key descriptor to scan for dust UTXOs
     Add {

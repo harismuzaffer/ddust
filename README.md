@@ -37,13 +37,16 @@ ddust --help
 ```
 
 ```
+A simple tool that finds and spends dust UTXOs in a privacy-preserving way
+
 Usage: ddust [OPTIONS] <COMMAND>
 
 Commands:
+  desc       List public key descriptors that will be scanned for dust UTXOs
   add        Add a public key descriptor to scan for dust UTXOs
-  list       List all dust UTXOs in your wallet descriptor(s)
-  spend      Create a PSBT to spend dust UTXOs for an address to an OP_RETURN, the entire amount will go to fees
-  broadcast  Broadcast a PSBT after it's been signed
+  list       List all dust UTXOs in your wallet descriptor(s), returns json array
+  spend      Spend dust UTXOs to an OP_RETURN, the entire amount goes to fees, returns PSBT
+  broadcast  Broadcast a PSBT after it's been signed, returns txid
   help       Print this message or the help of the given subcommand(s)
 
 Options:
