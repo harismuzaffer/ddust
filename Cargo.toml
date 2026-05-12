@@ -2,8 +2,8 @@
 name = "ddust"
 version = "0.1.0"
 edition = "2024"
-authors = ["bubb1es71 <bubb1es71@proton.me>"]
-license = "MIT"
+authors = ["ddust developers"]
+license = "MIT OR Apache-2.0"
 
 [dependencies]
 bdk_wallet = "3"
